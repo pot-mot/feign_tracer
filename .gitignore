@@ -1,0 +1,10 @@
+/feign-trace.db
+/feign-trace.json
+node_modules
+.idea
+.vscode
+.opencode
+.feign-tracer-cache
+.tmp
+dist
+

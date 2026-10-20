@@ -1,0 +1,45 @@
+{
+    "name": "feign-tracer",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Multi-language (Java/Kotlin/Groovy) ANTLR4 based call-graph and Feign/Maven/Gradle dependency tracer",
+    "type": "module",
+    "bin": {
+        "feign-tracer": "./dist/cli.js"
+    },
+    "scripts": {
+        "generate": "node scripts/generate-grammars.mjs",
+        "analyze": "tsx src/cli.ts",
+        "dev": "vite",
+        "build": "npm run typecheck && npm run build:web && npm run build:cli",
+        "build:web": "vite build",
+        "build:cli": "vite build --ssr src/cli.ts --outDir dist --emptyOutDir false",
+        "typecheck": "tsc --noEmit",
+        "format": "prettier --write \"src/**/*.ts\" \"web/**/*.ts\" \"vite.config.ts\"",
+        "start": "node dist/cli.js",
+        "sample": "tsx src/cli.ts examples/shop --format both --db examples/shop-result.db --out examples/shop-result.json",
+        "test": "tsx src/cli.ts examples/shop --format both --db .tmp/shop-result.db --out .tmp/shop-result.json --quiet",
+        "test:cycles": "tsx src/cli.ts examples/cycles --format both --db .tmp/cycles-result.db --out .tmp/cycles-result.json --class-name CycleService --method-name a --quiet"
+    },
+    "keywords": [
+        "antlr4",
+        "call-graph",
+        "feign",
+        "spring-cloud",
+        "maven",
+        "gradle"
+    ],
+    "license": "MIT",
+    "dependencies": {
+        "antlr4ng": "^3.0.16",
+        "node-sqlite3-wasm": "^0.8.61"
+    },
+    "devDependencies": {
+        "@types/node": "^24.10.1",
+        "antlr-ng": "^1.0.10",
+        "prettier": "^3.9.10",
+        "tsx": "^4.21.0",
+        "typescript": "^5.9.3",
+        "vite": "^7.2.2"
+    }
+}
