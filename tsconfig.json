@@ -20,6 +20,6 @@
     "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "web/**/*.ts", "vite.config.ts"],
+  "include": ["src/**/*.ts", "web/**/*.ts", "tests/**/*.ts", "vite.config.ts"],
   "exclude": ["node_modules", "dist", "src/generated"]
 }

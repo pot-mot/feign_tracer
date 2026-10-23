@@ -4,6 +4,12 @@ import { join, relative, sep } from "node:path";
 export type ScanKind =
     "java" | "kotlin" | "groovy" | "maven" | "gradle" | "gradle-settings" | "gradle-other";
 
+/** 需要交给语言解析器的文件类型。 */
+export type SourceScanKind = Extract<ScanKind, "java" | "kotlin" | "groovy">;
+
+export const isSourceKind = (kind: ScanKind): kind is SourceScanKind =>
+    kind === "java" || kind === "kotlin" || kind === "groovy";
+
 export interface ScannedFile {
     absPath: string;
     /** 相对分析根目录的 POSIX 风格路径。 */
@@ -38,11 +44,21 @@ export const toPosix = (value: string): string => {
     return value.split(sep).join("/");
 };
 
+/** 目录名比较只用于保证扫描顺序稳定，代码单元比较比 localeCompare 快得多。 */
+const compareNames = (left: string, right: string): number => {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+};
+
 export const scanProject = (
     root: string,
     options: { maxFiles: number; ignore: string[] },
 ): { files: ScannedFile[]; truncated: boolean; ignoredDirs: string[] } => {
-    const ignore = new Set([...DEFAULT_IGNORES, ...options.ignore]);
+    // Windows 文件系统大小写不敏感，忽略目录名统一按小写匹配。
+    const ignore = new Set(
+        [...DEFAULT_IGNORES, ...options.ignore].map((name) => name.toLowerCase()),
+    );
     const files: ScannedFile[] = [];
     const ignoredDirs: string[] = [];
     let truncated = false;
@@ -57,7 +73,7 @@ export const scanProject = (
         } catch {
             continue;
         }
-        entries.sort((left, right) => left.name.localeCompare(right.name));
+        entries.sort((left, right) => compareNames(left.name, right.name));
 
         for (const entry of entries) {
             if (files.length >= options.maxFiles) {
@@ -67,7 +83,7 @@ export const scanProject = (
             const absPath = join(dir, entry.name);
             if (entry.isSymbolicLink()) continue;
             if (entry.isDirectory()) {
-                if (ignore.has(entry.name)) {
+                if (ignore.has(entry.name.toLowerCase())) {
                     ignoredDirs.push(toPosix(relative(root, absPath)));
                     continue;
                 }
@@ -94,10 +110,14 @@ const classify = (name: string): ScanKind | undefined => {
     if (name === "pom.xml") return "maven";
     if (name === "settings.gradle" || name === "settings.gradle.kts") return "gradle-settings";
     if (name === "build.gradle" || name === "build.gradle.kts") return "gradle";
-    if (name.endsWith(".gradle") || name.endsWith(".gradle.kts")) return "gradle-other";
-    if (name.endsWith(".java")) return "java";
-    if (name.endsWith(".kt")) return "kotlin";
-    if (name.endsWith(".groovy")) return "groovy";
+    // 先判断高频源码后缀，避免对大目录逐条执行多次 endsWith。
+    const dot = name.lastIndexOf(".");
+    if (dot < 0) return undefined;
+    const extension = name.slice(dot);
+    if (extension === ".java") return "java";
+    if (extension === ".kt") return "kotlin";
+    if (extension === ".groovy") return "groovy";
+    if (extension === ".gradle" || name.endsWith(".gradle.kts")) return "gradle-other";
     return undefined;
 };
 

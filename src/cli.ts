@@ -2,7 +2,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { analyzeDirectory } from "./analyze.ts";
+import { analyzeDirectoryAsync } from "./analyze.ts";
 import type { AnalysisResult, CallTreeNode } from "./model.ts";
 import type { DeepReadonly } from "./types.ts";
 import { writeAnalysisToSqlite, type SqliteWriteResult } from "./store/sqlite.ts";
@@ -14,7 +14,7 @@ type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 const isOutputFormat = (value: string): value is OutputFormat =>
     OUTPUT_FORMATS.some((format) => format === value);
 
-const main = (): void => {
+const main = async (): Promise<void> => {
     const { values, positionals } = parseArgs({
         allowPositionals: true,
         options: {
@@ -36,6 +36,7 @@ const main = (): void => {
             "rebuild-dir": { type: "string" },
             "no-cache": { type: "boolean", default: false },
             "cache-dir": { type: "string", default: ".feign-tracer-cache" },
+            jobs: { type: "string", default: "0" },
             fresh: { type: "boolean", default: false },
             "hide-params": { type: "boolean", default: false },
             "show-param-types": { type: "boolean", default: false },
@@ -78,7 +79,7 @@ const main = (): void => {
             methodNames.length > 0 ||
             Boolean(values["rebuild-dir"]) ||
             Boolean(values["no-trees"]));
-    const result = analyzeDirectory({
+    const result = await analyzeDirectoryAsync({
         root,
         maxDepth: numberOption(values["max-depth"], 12),
         maxFiles: numberOption(values["max-files"], 50000),
@@ -98,6 +99,7 @@ const main = (): void => {
         rebuildDir: values["rebuild-dir"],
         useCache: !values["no-cache"],
         cacheDir: String(values["cache-dir"]),
+        parseWorkers: workerOption(values.jobs),
         ignore: values.ignore ? splitList(values.ignore) : [],
     });
 
@@ -154,6 +156,12 @@ const splitList = (value: string): string[] => {
 const numberOption = (value: unknown, fallback: number): number => {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+/** --jobs 允许 0（自动），因此不能复用 numberOption 的 > 0 限制。 */
+const workerOption = (value: unknown): number => {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 };
 
 const printSummary = (
@@ -306,6 +314,7 @@ Options:
                          Re-parse and rebuild only endpoints under this directory
       --no-cache         Disable the per-file parse cache
       --cache-dir <dir>  Parse cache directory                    [.feign-tracer-cache]
+      --jobs <n>         Parsing worker threads: 0 = auto, 1 = off          [0]
       --fresh            Replace the database instead of merging incremental runs
       --list-endpoints   Print endpoints/traces with their built status
       --hide-params      Hide parameter lists in --print-trees output
@@ -360,9 +369,7 @@ Tree order:
 `);
 };
 
-try {
-    main();
-} catch (error) {
+main().catch((error: unknown) => {
     console.error(`feign-tracer: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
-}
+});

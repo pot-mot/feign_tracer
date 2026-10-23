@@ -347,6 +347,8 @@ export interface AnalyzeOptions {
     useCache: boolean;
     /** 解析缓存目录（相对当前工作目录解析）。 */
     cacheDir: string;
+    /** 解析使用的 worker 线程数：0 自动，1 表示单线程。 */
+    parseWorkers: number;
     maxFiles: number;
     ignore: string[];
 }

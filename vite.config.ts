@@ -1,6 +1,6 @@
 import { defineConfig, type Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { analyzeDirectory } from "./src/analyze.ts";
+import { analyzeDirectoryAsync } from "./src/analyze.ts";
 import { writeAnalysisToSqlite } from "./src/store/sqlite.ts";
 
 const readBody = (request: IncomingMessage): Promise<string> => {
@@ -104,7 +104,7 @@ const analyzeMiddleware = async (request: IncomingMessage, response: ServerRespo
                 methodNames.length > 0 ||
                 Boolean(payload.rebuildDir) ||
                 !buildTrees);
-        const result = analyzeDirectory({
+        const result = await analyzeDirectoryAsync({
             root: payload.root,
             maxDepth: payload.maxDepth,
             includeExternal: payload.includeExternal,

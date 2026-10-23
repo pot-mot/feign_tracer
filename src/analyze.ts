@@ -11,12 +11,9 @@ import type {
     TypeInfo,
 } from "./model.ts";
 import type { DeepReadonly } from "./types.ts";
-import { scanProject } from "./scan.ts";
+import { isSourceKind, scanProject, type ScannedFile } from "./scan.ts";
 import { buildMavenModules, parsePom } from "./build/maven.ts";
 import { buildGradleModules, parseGradleSettings, type GradleSettings } from "./build/gradle.ts";
-import { parseJavaFile } from "./languages/java.ts";
-import { parseKotlinFile } from "./languages/kotlin.ts";
-import { parseGroovyFile } from "./languages/groovy.ts";
 import { createProjectIndex, type ProjectIndex } from "./graph/index.ts";
 import { buildEndpoints, linkFeignEndpoints } from "./graph/endpoints.ts";
 import { buildCallTrees, buildTraceTrees } from "./graph/calls.ts";
@@ -24,7 +21,9 @@ import { buildFileAnalyses } from "./graph/files.ts";
 import { selectEndpoints } from "./graph/select.ts";
 import { buildMethodTraces, filterTracesByKeywords } from "./graph/traces.ts";
 import { resolveCalls, type ResolvedCall } from "./graph/resolve.ts";
-import { createParseCache } from "./cache.ts";
+import { createParseCache, type ParseCacheOptions } from "./cache.ts";
+import { parseTasksInline, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
+import { parseFilesInPool } from "./parse-pool.ts";
 
 const TOOL_VERSION = "1.0.0";
 
@@ -55,13 +54,69 @@ export const DEFAULT_OPTIONS: Omit<AnalyzeOptions, "root"> = {
     buildTrees: true,
     useCache: true,
     cacheDir: ".feign-tracer-cache",
+    parseWorkers: 0,
     maxFiles: 50000,
     ignore: [],
 };
 
+export interface AnalyzeAsyncOptions {
+    /** 解析进度回调；worker 回退到单线程时不会触发。 */
+    readonly onProgress?: (completed: number, total: number) => void;
+}
+
+interface GradleBuildFile {
+    readonly absPath: string;
+    readonly relPath: string;
+    readonly dir: string;
+}
+
+/**
+ * 扫描、模块解析与解析任务准备。所有共享可变状态（模块 fileCount）
+ * 都只在这里之后由主线程统一写入，确保并行解析结果与单线程一致。
+ */
+interface PreparedAnalysis {
+    readonly started: number;
+    readonly root: string;
+    readonly options: AnalyzeOptions;
+    readonly warnings: string[];
+    readonly scanned: ReturnType<typeof scanProject>;
+    readonly pomFiles: ScannedFile[];
+    readonly settingsFiles: ScannedFile[];
+    readonly gradleBuildFiles: GradleBuildFile[];
+    readonly modules: ModuleInfo[];
+    readonly classFilterRegexes: RegExp[];
+    readonly tasks: ParseTask[];
+    readonly taskModules: Array<ModuleInfo | undefined>;
+    readonly cacheOptions: ParseCacheOptions | undefined;
+}
+
 export const analyzeDirectory = (
     input: Partial<AnalyzeOptions> & { root: string },
 ): DeepReadonly<AnalysisResult> => {
+    const prepared = prepareAnalysis(input);
+    const cache = prepared.cacheOptions ? createParseCache(prepared.cacheOptions) : undefined;
+    const outcomes = parseTasksInline(prepared.tasks, cache);
+    return finalizeAnalysis(prepared, collectParsedFiles(prepared, outcomes));
+};
+
+/**
+ * 并行解析版本：按 CPU 核数启动 worker，解析完成后复用同一套图分析流程。
+ * 单线程版本 `analyzeDirectory` 保留给需要同步结果的调用方。
+ */
+export const analyzeDirectoryAsync = async (
+    input: Partial<AnalyzeOptions> & { root: string },
+    asyncOptions: AnalyzeAsyncOptions = {},
+): Promise<DeepReadonly<AnalysisResult>> => {
+    const prepared = prepareAnalysis(input);
+    const poolResult = await parseFilesInPool(prepared.tasks, {
+        ...(prepared.cacheOptions ?? { root: prepared.root }),
+        jobs: prepared.options.parseWorkers,
+        onProgress: asyncOptions.onProgress,
+    });
+    return finalizeAnalysis(prepared, collectParsedFiles(prepared, poolResult.outcomes));
+};
+
+const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): PreparedAnalysis => {
     const started = Date.now();
     const root = resolve(input.root);
     if (!existsSync(root) || !statSync(root).isDirectory()) {
@@ -82,11 +137,6 @@ export const analyzeDirectory = (
 
     const warnings: string[] = [];
     const rebuildDirAbs = options.rebuildDir ? resolve(root, options.rebuildDir) : undefined;
-    const cache = createParseCache({
-        cacheDir: options.useCache ? options.cacheDir : undefined,
-        root,
-        rebuildDir: rebuildDirAbs,
-    });
     const classFilterRegexes: RegExp[] = [];
     for (const source of options.classFilters) {
         try {
@@ -114,7 +164,7 @@ export const analyzeDirectory = (
         .map((file) => parseGradleSettings(file.absPath, file.relPath))
         .filter((settings): settings is GradleSettings => settings !== undefined);
 
-    const gradleBuildFiles = scanned.files
+    const gradleBuildFiles: GradleBuildFile[] = scanned.files
         .filter((file) => file.kind === "gradle")
         .map((file) => ({
             absPath: file.absPath,
@@ -128,7 +178,7 @@ export const analyzeDirectory = (
     const gradleErrors: string[] = [];
     const groups = new Map<
         string,
-        { settings: GradleSettings | undefined; builds: typeof gradleBuildFiles }
+        { settings: GradleSettings | undefined; builds: GradleBuildFile[] }
     >();
     groups.set("", { settings: undefined, builds: [] });
     for (const settings of settingsList) groups.set(settings.relPath, { settings, builds: [] });
@@ -170,8 +220,7 @@ export const analyzeDirectory = (
         ];
     }
 
-    // 先完成模块解析再解析源码，使每个文件都能关联到模块。
-    const parsedFiles: ParsedFile[] = [];
+    // 先完成模块解析再生成解析任务，使每个文件都能关联到模块。
     const sortedModules = [...modules].sort(
         (left, right) =>
             (right.dir === "." ? 0 : right.dir.length) - (left.dir === "." ? 0 : left.dir.length),
@@ -184,41 +233,77 @@ export const analyzeDirectory = (
         return undefined;
     };
 
+    const tasks: ParseTask[] = [];
+    const taskModules: Array<ModuleInfo | undefined> = [];
     for (const file of scanned.files) {
-        if (file.kind !== "java" && file.kind !== "kotlin" && file.kind !== "groovy") continue;
+        if (!isSourceKind(file.kind)) continue;
         const module = assignModule(file.relPath);
-        const cached = cache.load(file.absPath, module?.id);
-        if (cached) {
-            parsedFiles.push(cached);
-            if (module) module.fileCount++;
-            continue;
-        }
-        try {
-            const parsed =
-                file.kind === "java"
-                    ? parseJavaFile(file.absPath, file.relPath, module?.id)
-                    : file.kind === "kotlin"
-                      ? parseKotlinFile(file.absPath, file.relPath, module?.id)
-                      : parseGroovyFile(file.absPath, file.relPath, module?.id);
-            parsedFiles.push(parsed);
-            cache.save(file.absPath, parsed, module?.id);
-            if (module) module.fileCount++;
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            warnings.push(`Failed to parse ${file.relPath}: ${message}`);
-            parsedFiles.push({
-                path: file.relPath,
-                absPath: file.absPath,
-                language: file.kind,
-                moduleId: module?.id,
-                packageName: "",
-                imports: [],
-                types: [],
-                parseErrors: 1,
-                lineCount: 0,
-            });
-        }
+        tasks.push({
+            absPath: file.absPath,
+            relPath: file.relPath,
+            kind: file.kind,
+            moduleId: module?.id,
+        });
+        taskModules.push(module);
     }
+
+    return {
+        started,
+        root,
+        options,
+        warnings,
+        scanned,
+        pomFiles,
+        settingsFiles,
+        gradleBuildFiles,
+        modules,
+        classFilterRegexes,
+        tasks,
+        taskModules,
+        cacheOptions: options.useCache
+            ? { cacheDir: options.cacheDir, root, rebuildDir: rebuildDirAbs }
+            : undefined,
+    };
+};
+
+/**
+ * 按任务顺序合并解析结果。模块 fileCount 与警告顺序都在这里统一处理，
+ * 因此 worker 数量不会影响最终输出。
+ */
+const collectParsedFiles = (
+    prepared: PreparedAnalysis,
+    outcomes: readonly ParseTaskOutcome[],
+): ParsedFile[] => {
+    const parsedFiles: ParsedFile[] = [];
+    for (let index = 0; index < outcomes.length; index++) {
+        const outcome = outcomes[index];
+        const module = prepared.taskModules[index];
+        if (outcome.warning) {
+            prepared.warnings.push(outcome.warning);
+        } else if (module) {
+            module.fileCount++;
+        }
+        parsedFiles.push(outcome.parsed);
+    }
+    return parsedFiles;
+};
+
+const finalizeAnalysis = (
+    prepared: PreparedAnalysis,
+    parsedFiles: ParsedFile[],
+): DeepReadonly<AnalysisResult> => {
+    const {
+        started,
+        root,
+        options,
+        warnings,
+        scanned,
+        pomFiles,
+        settingsFiles,
+        gradleBuildFiles,
+        modules,
+        classFilterRegexes,
+    } = prepared;
 
     const index = createProjectIndex(parsedFiles, modules);
     const endpointResult = buildEndpoints(index);
