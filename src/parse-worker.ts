@@ -1,41 +1,41 @@
-import { parentPort } from "node:worker_threads";
-import { createParseCache } from "./cache.ts";
-import { parseTasksInline } from "./languages/parse-file.ts";
+import { parentPort, workerData } from "node:worker_threads";
+import { createParseCache, type ParseCache } from "./cache.ts";
+import { parseTask } from "./languages/parse-file.ts";
 import {
-    isParseBatchRequest,
-    type ParseBatchError,
-    type ParseBatchResult,
+    isParseTaskRequest,
+    type ParseTaskError,
+    type ParseTaskResult,
+    type ParseWorkerData,
 } from "./parse-protocol.ts";
 
 /**
- * 解析 worker：只接收批量文件任务，返回按原顺序排列的解析结果。
- * 缓存读写也放在 worker 内，冷启动时可以把磁盘 I/O 摊到多个核上。
+ * 解析 worker：一条消息只处理一个文件。
+ *
+ * 逐文件而不是逐批，是为了把主线程和 worker 的峰值都压到「同时只有一个
+ * 文件被解析」；批处理会让一个 worker 在返回前把所有批次结果同时留在堆上，
+ * 大文件项目里这正是内存峰值的来源。
  */
 const port = parentPort;
 if (port) {
-    // 同一 worker 的所有批次共享缓存对象，避免每批重复计算缓存目录哈希。
-    let cache: ReturnType<typeof createParseCache> | undefined;
-    let cacheReady = false;
+    const options: ParseWorkerData | undefined =
+        workerData !== null && typeof workerData === "object" ? workerData : undefined;
+    const cache: ParseCache | undefined = options?.cache
+        ? createParseCache(options.cache)
+        : undefined;
 
     port.on("message", (message: unknown) => {
-        if (!isParseBatchRequest(message)) return;
-
+        if (!isParseTaskRequest(message)) return;
         try {
-            if (!cacheReady) {
-                cache = message.cache ? createParseCache(message.cache) : undefined;
-                cacheReady = true;
-            }
-            const outcomes = parseTasksInline(message.tasks, cache);
-            const response: ParseBatchResult = {
+            const response: ParseTaskResult = {
                 type: "result",
-                batchId: message.batchId,
-                outcomes,
+                taskId: message.taskId,
+                outcome: parseTask(message.task, cache),
             };
             port.postMessage(response);
         } catch (error) {
-            const response: ParseBatchError = {
+            const response: ParseTaskError = {
                 type: "error",
-                batchId: message.batchId,
+                taskId: message.taskId,
                 message: error instanceof Error ? error.message : String(error),
             };
             port.postMessage(response);

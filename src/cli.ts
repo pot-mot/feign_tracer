@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { analyzeDirectoryAsync } from "./analyze.ts";
 import type { AnalysisResult, CallTreeNode } from "./model.ts";
 import type { DeepReadonly } from "./types.ts";
 import { writeAnalysisToSqlite, type SqliteWriteResult } from "./store/sqlite.ts";
+import { removeTreeSpool } from "./store/tree-spool.ts";
 import { DEFAULT_DISPLAY_MODE, formatNodeLabel, type DisplayMode } from "./graph/display.ts";
 
 const OUTPUT_FORMATS = ["sqlite", "json", "both"] as const;
@@ -36,6 +38,7 @@ const main = async (): Promise<void> => {
             "rebuild-dir": { type: "string" },
             "no-cache": { type: "boolean", default: false },
             "cache-dir": { type: "string", default: ".feign-tracer-cache" },
+            "no-work-db": { type: "boolean", default: false },
             jobs: { type: "string", default: "0" },
             fresh: { type: "boolean", default: false },
             "hide-params": { type: "boolean", default: false },
@@ -79,29 +82,44 @@ const main = async (): Promise<void> => {
             methodNames.length > 0 ||
             Boolean(values["rebuild-dir"]) ||
             Boolean(values["no-trees"]));
-    const result = await analyzeDirectoryAsync({
-        root,
-        maxDepth: numberOption(values["max-depth"], 12),
-        maxFiles: numberOption(values["max-files"], 50000),
-        includeExternal: Boolean(values["include-external"]),
-        followFeign: !values["no-follow-feign"],
-        includeSource: !values["no-source"],
-        excludeSelfCalls: Boolean(values["exclude-self-calls"]),
-        classFilters: values["all-classes"]
-            ? []
-            : classFilterOption
-              ? splitList(classFilterOption)
-              : undefined,
-        keywords,
-        classNames,
-        methodNames,
-        buildTrees: !values["no-trees"],
-        rebuildDir: values["rebuild-dir"],
-        useCache: !values["no-cache"],
-        cacheDir: String(values["cache-dir"]),
-        parseWorkers: workerOption(values.jobs),
-        ignore: values.ignore ? splitList(values.ignore) : [],
-    });
+
+    const toStdout = values.stdout || values.out === "-";
+    /*
+     * 只有「纯 SQLite 输出」才能把调用树流式写到暂存文件：
+     * JSON/stdout 必须内联整棵树，--print-trees 也要在分析后继续遍历。
+     */
+    const treeSpoolPath =
+        !toStdout && format === "sqlite" && !values["print-trees"] && !values["no-trees"]
+            ? join(tmpdir(), `feign-tracer-trees-${process.pid}-${Date.now()}.ndjson`)
+            : undefined;
+
+    const result = await analyzeDirectoryAsync(
+        {
+            root,
+            maxDepth: numberOption(values["max-depth"], 12),
+            maxFiles: numberOption(values["max-files"], 50000),
+            includeExternal: Boolean(values["include-external"]),
+            followFeign: !values["no-follow-feign"],
+            includeSource: !values["no-source"],
+            excludeSelfCalls: Boolean(values["exclude-self-calls"]),
+            classFilters: values["all-classes"]
+                ? []
+                : classFilterOption
+                  ? splitList(classFilterOption)
+                  : undefined,
+            keywords,
+            classNames,
+            methodNames,
+            buildTrees: !values["no-trees"],
+            rebuildDir: values["rebuild-dir"],
+            useCache: !values["no-cache"],
+            cacheDir: String(values["cache-dir"]),
+            parseWorkers: workerOption(values.jobs),
+            workDb: !values["no-work-db"],
+            ignore: values.ignore ? splitList(values.ignore) : [],
+        },
+        { treeSpoolPath },
+    );
 
     const displayMode: DisplayMode = {
         ...DEFAULT_DISPLAY_MODE,
@@ -110,7 +128,6 @@ const main = async (): Promise<void> => {
         visibility: Boolean(values["show-visibility"]),
     };
 
-    const toStdout = values.stdout || values.out === "-";
     let jsonPath: string | undefined;
     let dbInfo: SqliteWriteResult | undefined;
 
@@ -126,7 +143,14 @@ const main = async (): Promise<void> => {
             jsonPath = outPath;
         }
         if (format === "sqlite" || format === "both") {
-            dbInfo = writeAnalysisToSqlite(result, String(values.db), { merge: incremental });
+            try {
+                dbInfo = writeAnalysisToSqlite(result, String(values.db), {
+                    merge: incremental,
+                    treeSpool: treeSpoolPath,
+                });
+            } finally {
+                removeTreeSpool(treeSpoolPath);
+            }
         }
         if (!values.quiet) printSummary(result, { jsonPath, dbInfo });
     }
@@ -314,6 +338,7 @@ Options:
                          Re-parse and rebuild only endpoints under this directory
       --no-cache         Disable the per-file parse cache
       --cache-dir <dir>  Parse cache directory                    [.feign-tracer-cache]
+      --no-work-db       Keep every method body in memory (small projects only)
       --jobs <n>         Parsing worker threads: 0 = auto, 1 = off          [0]
       --fresh            Replace the database instead of merging incremental runs
       --list-endpoints   Print endpoints/traces with their built status
@@ -356,6 +381,12 @@ Storage:
   feign_operations, feign_operation_targets, source_files, file_dependencies,
   warnings and the views v_endpoint_overview, v_trace_overview,
   v_module_overview, v_file_overview.
+
+Memory:
+  Parsed method bodies are spilled to a throwaway SQLite work database and
+  call trees are streamed to a temp file, so peak memory tracks the largest
+  single file instead of the whole project. --format json and --format both
+  must inline the trees, which costs more memory on large projects.
 
 Output:
   JSON: meta, stats, modules, moduleEdges, endpoints[].tree, traces[].tree,

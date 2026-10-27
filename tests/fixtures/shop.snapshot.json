@@ -1,0 +1,695 @@
+{
+    "stats": {
+        "filesScanned": 16,
+        "sourceFiles": 12,
+        "javaFiles": 11,
+        "kotlinFiles": 0,
+        "groovyFiles": 1,
+        "buildFiles": 4,
+        "modules": 4,
+        "types": 12,
+        "methods": 26,
+        "calls": 12,
+        "resolvedCalls": 12,
+        "endpoints": 3,
+        "endpointsBuilt": 3,
+        "traces": 0,
+        "tracesBuilt": 0,
+        "feignClients": 1,
+        "feignOperations": 2,
+        "parseErrors": 0
+    },
+    "modules": [
+        {
+            "id": "shop-parent",
+            "name": "shop-parent",
+            "buildTool": "maven",
+            "dir": "",
+            "fileCount": 0,
+            "dependencies": []
+        },
+        {
+            "id": "user-service",
+            "name": "user-service",
+            "buildTool": "maven",
+            "dir": "user-service",
+            "fileCount": 4,
+            "dependencies": [
+                {
+                    "to": "common",
+                    "artifactId": "common",
+                    "external": false
+                }
+            ]
+        },
+        {
+            "id": "order-service",
+            "name": "order-service",
+            "buildTool": "maven",
+            "dir": "order-service",
+            "fileCount": 7,
+            "dependencies": [
+                {
+                    "to": "common",
+                    "artifactId": "common",
+                    "external": false
+                },
+                {
+                    "artifactId": "spring-cloud-starter-openfeign",
+                    "external": true
+                }
+            ]
+        },
+        {
+            "id": "common",
+            "name": "common",
+            "buildTool": "maven",
+            "dir": "common",
+            "fileCount": 1,
+            "dependencies": [
+                {
+                    "artifactId": "jackson-annotations",
+                    "external": true
+                }
+            ]
+        }
+    ],
+    "moduleEdges": [
+        [
+            "user-service",
+            "common",
+            1
+        ],
+        [
+            "order-service",
+            "common",
+            1
+        ]
+    ],
+    "endpoints": [
+        {
+            "id": "GET /users/{id}",
+            "httpMethod": "GET",
+            "paths": [
+                "/users/{id}"
+            ],
+            "handler": "com.example.user.controller.UserController#getUser/1",
+            "handlerLabel": "UserController.getUser(id)",
+            "controller": "com.example.user.controller.UserController",
+            "moduleId": "user-service",
+            "file": "user-service/src/main/java/com/example/user/controller/UserController.java",
+            "line": 23,
+            "treeBuilt": true,
+            "tree": {
+                "seq": "0",
+                "label": "UserController.getUser(id)",
+                "kind": "controller",
+                "depth": 0,
+                "children": [
+                    {
+                        "seq": "0-0",
+                        "label": "UserService.getUser(id)",
+                        "kind": "service",
+                        "depth": 1,
+                        "children": [
+                            {
+                                "seq": "0-0-0",
+                                "label": "UserMapper.findById(id)",
+                                "kind": "mapper",
+                                "depth": 2,
+                                "children": []
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "id": "GET /users/list",
+            "httpMethod": "GET",
+            "paths": [
+                "/users/list"
+            ],
+            "handler": "com.example.user.controller.UserController#listUsers/1",
+            "handlerLabel": "UserController.listUsers(name)",
+            "controller": "com.example.user.controller.UserController",
+            "moduleId": "user-service",
+            "file": "user-service/src/main/java/com/example/user/controller/UserController.java",
+            "line": 28,
+            "treeBuilt": true,
+            "tree": {
+                "seq": "0",
+                "label": "UserController.listUsers(name)",
+                "kind": "controller",
+                "depth": 0,
+                "children": [
+                    {
+                        "seq": "0-0",
+                        "label": "UserService.listUsers(name)",
+                        "kind": "service",
+                        "depth": 1,
+                        "children": [
+                            {
+                                "seq": "0-0-0",
+                                "label": "UserMapper.listUsers(name)",
+                                "kind": "mapper",
+                                "depth": 2,
+                                "children": []
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "id": "GET /api/orders/list",
+            "httpMethod": "GET",
+            "paths": [
+                "/api/orders/list"
+            ],
+            "handler": "com.example.order.controller.OrderController#list/1",
+            "handlerLabel": "OrderController.list(name)",
+            "controller": "com.example.order.controller.OrderController",
+            "moduleId": "order-service",
+            "file": "order-service/src/main/java/com/example/order/controller/OrderController.java",
+            "line": 22,
+            "treeBuilt": true,
+            "tree": {
+                "seq": "0",
+                "label": "OrderController.list(name)",
+                "kind": "controller",
+                "depth": 0,
+                "children": [
+                    {
+                        "seq": "0-0",
+                        "label": "OrderService.list(name)",
+                        "kind": "service",
+                        "depth": 1,
+                        "children": [
+                            {
+                                "seq": "0-0-0",
+                                "label": "OrderMapper.list(name)",
+                                "kind": "mapper",
+                                "depth": 2,
+                                "children": []
+                            }
+                        ]
+                    },
+                    {
+                        "seq": "0-1",
+                        "label": "OrderService.fillCreatorNames(orders)",
+                        "kind": "service",
+                        "depth": 1,
+                        "children": [
+                            {
+                                "seq": "0-1-0",
+                                "label": "UserClient.listUsers(name)",
+                                "kind": "feign",
+                                "depth": 2,
+                                "feign": {
+                                    "service": "user-service",
+                                    "httpMethod": "GET",
+                                    "path": "/users/list"
+                                },
+                                "children": [
+                                    {
+                                        "seq": "0-1-0-0",
+                                        "label": "UserController.listUsers(name)",
+                                        "kind": "remote",
+                                        "depth": 3,
+                                        "remote": {
+                                            "endpoint": "GET /users/list",
+                                            "service": "user-service"
+                                        },
+                                        "children": [
+                                            {
+                                                "seq": "0-1-0-0-0",
+                                                "label": "UserService.listUsers(name)",
+                                                "kind": "service",
+                                                "depth": 4,
+                                                "children": [
+                                                    {
+                                                        "seq": "0-1-0-0-0-0",
+                                                        "label": "UserMapper.listUsers(name)",
+                                                        "kind": "mapper",
+                                                        "depth": 5,
+                                                        "children": []
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    ],
+    "traces": [],
+    "feignClients": [
+        {
+            "id": "com.example.order.client.UserClient",
+            "name": "UserClient",
+            "serviceName": "user-service",
+            "file": "order-service/src/main/java/com/example/order/client/UserClient.java",
+            "methods": [
+                {
+                    "id": "com.example.order.client.UserClient#listUsers/1",
+                    "httpMethod": "GET",
+                    "paths": [
+                        "/users/list"
+                    ],
+                    "signature": "com.example.order.client.UserClient#listUsers(String)"
+                },
+                {
+                    "id": "com.example.order.client.UserClient#getUser/1",
+                    "httpMethod": "GET",
+                    "paths": [
+                        "/users/{id}"
+                    ],
+                    "signature": "com.example.order.client.UserClient#getUser(Long)"
+                }
+            ]
+        }
+    ],
+    "feignOperations": [
+        {
+            "id": "com.example.order.client.UserClient#listUsers/1",
+            "client": "UserClient",
+            "httpMethod": "GET",
+            "path": "/users/list",
+            "serviceName": "user-service",
+            "targetEndpoints": [
+                "GET /users/list::com.example.user.controller.UserController#listUsers/1"
+            ]
+        },
+        {
+            "id": "com.example.order.client.UserClient#getUser/1",
+            "client": "UserClient",
+            "httpMethod": "GET",
+            "path": "/users/{id}",
+            "serviceName": "user-service",
+            "targetEndpoints": [
+                "GET /users/{id}::com.example.user.controller.UserController#getUser/1"
+            ]
+        }
+    ],
+    "files": [
+        {
+            "path": "user-service/src/main/java/com/example/user/service/UserService.java",
+            "language": "java",
+            "moduleId": "user-service",
+            "packageName": "com.example.user.service",
+            "imports": [
+                "com.example.common.dto.User",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.user.service.UserService"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "return"
+                    ],
+                    "count": 2
+                }
+            ]
+        },
+        {
+            "path": "user-service/src/main/java/com/example/user/service/UserServiceImpl.java",
+            "language": "java",
+            "moduleId": "user-service",
+            "packageName": "com.example.user.service",
+            "imports": [
+                "com.example.common.dto.User",
+                "com.example.user.mapper.UserMapper",
+                "org.springframework.stereotype.Service",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.user.service.UserServiceImpl"
+            ],
+            "calls": 2,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "return"
+                    ],
+                    "count": 2
+                },
+                {
+                    "to": "user-service/src/main/java/com/example/user/mapper/UserMapper.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter",
+                        "call",
+                        "mapper"
+                    ],
+                    "count": 7
+                },
+                {
+                    "to": "user-service/src/main/java/com/example/user/service/UserService.java",
+                    "kinds": [
+                        "extends"
+                    ],
+                    "count": 1
+                }
+            ]
+        },
+        {
+            "path": "user-service/src/main/java/com/example/user/mapper/UserMapper.java",
+            "language": "java",
+            "moduleId": "user-service",
+            "packageName": "com.example.user.mapper",
+            "imports": [
+                "com.example.common.dto.User",
+                "org.apache.ibatis.annotations.Mapper",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.user.mapper.UserMapper"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "return"
+                    ],
+                    "count": 2
+                }
+            ]
+        },
+        {
+            "path": "user-service/src/main/java/com/example/user/controller/UserController.java",
+            "language": "java",
+            "moduleId": "user-service",
+            "packageName": "com.example.user.controller",
+            "imports": [
+                "com.example.common.dto.User",
+                "com.example.user.service.UserService",
+                "org.springframework.web.bind.annotation.GetMapping",
+                "org.springframework.web.bind.annotation.PathVariable",
+                "org.springframework.web.bind.annotation.RequestMapping",
+                "org.springframework.web.bind.annotation.RequestParam",
+                "org.springframework.web.bind.annotation.RestController",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.user.controller.UserController"
+            ],
+            "calls": 2,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "return"
+                    ],
+                    "count": 2
+                },
+                {
+                    "to": "user-service/src/main/java/com/example/user/service/UserService.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter"
+                    ],
+                    "count": 3
+                },
+                {
+                    "to": "user-service/src/main/java/com/example/user/service/UserServiceImpl.java",
+                    "kinds": [
+                        "call"
+                    ],
+                    "count": 2
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/service/OrderService.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.service",
+            "imports": [
+                "com.example.order.dto.Order",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.order.service.OrderService"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "order-service/src/main/java/com/example/order/dto/Order.java",
+                    "kinds": [
+                        "import"
+                    ],
+                    "count": 1
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/service/OrderServiceImpl.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.service",
+            "imports": [
+                "com.example.common.dto.User",
+                "com.example.order.client.UserClient",
+                "com.example.order.dto.Order",
+                "com.example.order.mapper.OrderMapper",
+                "org.springframework.stereotype.Service",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.order.service.OrderServiceImpl"
+            ],
+            "calls": 5,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "call"
+                    ],
+                    "count": 2
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/client/UserClient.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter",
+                        "call",
+                        "feign"
+                    ],
+                    "count": 5
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/dto/Order.java",
+                    "kinds": [
+                        "import",
+                        "call"
+                    ],
+                    "count": 3
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/mapper/OrderMapper.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter",
+                        "call",
+                        "mapper"
+                    ],
+                    "count": 5
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/service/OrderService.java",
+                    "kinds": [
+                        "extends"
+                    ],
+                    "count": 1
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/mapper/OrderMapper.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.mapper",
+            "imports": [
+                "com.example.order.dto.Order",
+                "org.apache.ibatis.annotations.Mapper",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.order.mapper.OrderMapper"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "order-service/src/main/java/com/example/order/dto/Order.java",
+                    "kinds": [
+                        "import"
+                    ],
+                    "count": 1
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/dto/Order.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.dto",
+            "imports": [],
+            "types": [
+                "com.example.order.dto.Order"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": []
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/controller/OrderController.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.controller",
+            "imports": [
+                "com.example.order.dto.Order",
+                "com.example.order.service.OrderService",
+                "org.springframework.web.bind.annotation.GetMapping",
+                "org.springframework.web.bind.annotation.RequestMapping",
+                "org.springframework.web.bind.annotation.RequestParam",
+                "org.springframework.web.bind.annotation.RestController",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.order.controller.OrderController"
+            ],
+            "calls": 2,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "order-service/src/main/java/com/example/order/dto/Order.java",
+                    "kinds": [
+                        "import"
+                    ],
+                    "count": 1
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/service/OrderService.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter"
+                    ],
+                    "count": 3
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/service/OrderServiceImpl.java",
+                    "kinds": [
+                        "call"
+                    ],
+                    "count": 2
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/java/com/example/order/client/UserClient.java",
+            "language": "java",
+            "moduleId": "order-service",
+            "packageName": "com.example.order.client",
+            "imports": [
+                "com.example.common.dto.User",
+                "org.springframework.cloud.openfeign.FeignClient",
+                "org.springframework.web.bind.annotation.GetMapping",
+                "org.springframework.web.bind.annotation.RequestParam",
+                "java.util.List"
+            ],
+            "types": [
+                "com.example.order.client.UserClient"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "common/src/main/java/com/example/common/dto/User.java",
+                    "kinds": [
+                        "import",
+                        "return"
+                    ],
+                    "count": 2
+                }
+            ]
+        },
+        {
+            "path": "order-service/src/main/groovy/com/example/order/LegacyOrderService.groovy",
+            "language": "groovy",
+            "moduleId": "order-service",
+            "packageName": "com.example.order",
+            "imports": [
+                "com.example.order.mapper.OrderMapper",
+                "com.example.order.dto.Order",
+                "org.springframework.stereotype.Service"
+            ],
+            "types": [
+                "com.example.order.LegacyOrderService"
+            ],
+            "calls": 1,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "order-service/src/main/java/com/example/order/dto/Order.java",
+                    "kinds": [
+                        "import"
+                    ],
+                    "count": 1
+                },
+                {
+                    "to": "order-service/src/main/java/com/example/order/mapper/OrderMapper.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "parameter",
+                        "call",
+                        "mapper"
+                    ],
+                    "count": 5
+                }
+            ]
+        },
+        {
+            "path": "common/src/main/java/com/example/common/dto/User.java",
+            "language": "java",
+            "moduleId": "common",
+            "packageName": "com.example.common.dto",
+            "imports": [],
+            "types": [
+                "com.example.common.dto.User"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": []
+        }
+    ],
+    "warnings": []
+}

@@ -219,6 +219,18 @@ export interface ScanCallOptions {
     keywords: Set<string>;
 }
 
+/** 可见 token 的 tokenIndex 单调递增，用二分定位方法体起点，避免逐方法扫描整份文件。 */
+const lowerBound = (tokens: Token[], target: number): number => {
+    let low = 0;
+    let high = tokens.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if ((tokens[middle].tokenIndex ?? -1) < target) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+};
+
 /**
  * 各语言共享的 token 级调用点检测。
  *
@@ -229,11 +241,12 @@ export interface ScanCallOptions {
 export const scanTokenCalls = (options: ScanCallOptions): CallSite[] => {
     const { tokens, source, startTokenIndex, endTokenIndex, keywords } = options;
     const calls: CallSite[] = [];
+    const start = lowerBound(tokens, startTokenIndex);
 
-    for (let index = 0; index < tokens.length; index++) {
+    for (let index = start; index < tokens.length; index++) {
         const token = tokens[index];
         const tokenIndex = token.tokenIndex ?? -1;
-        if (tokenIndex < startTokenIndex || tokenIndex > endTokenIndex) continue;
+        if (tokenIndex > endTokenIndex) break;
 
         const text = token.text ?? "";
         if (!IDENTIFIER.test(text)) continue;
@@ -289,9 +302,42 @@ export const scanTokenCalls = (options: ScanCallOptions): CallSite[] => {
     return calls.sort((left, right) => left.offset - right.offset);
 };
 
+/** 闭括号 -> 配对的开始符号；链式调用与下标访问都要整体跳过。 */
+const MATCHING_OPEN: Readonly<Record<string, string>> = { ")": "(", "]": "[" };
+
+/**
+ * 提取调用点的接收者源码。
+ *
+ * 链式调用 `a.b(x).c()` 里 `c` 的接收者是前一次调用的**结果**，不是某个名字，
+ * 因此先把紧邻的配对括号/下标整体跳过，再往回找边界。否则会把 `id)` 这种
+ * 残片当成接收者：既解析不出类型，也会把垃圾字符串写进结果。
+ */
 const qualifierText = (tokens: Token[], source: string, endIndex: number): string | undefined => {
     if (endIndex < 0) return undefined;
     let cursor = endIndex;
+
+    for (;;) {
+        const closer = tokens[cursor]?.text;
+        const opener = closer === undefined ? undefined : MATCHING_OPEN[closer];
+        if (opener === undefined) break;
+
+        let depth = 0;
+        let found = -1;
+        for (let index = cursor; index >= 0; index--) {
+            const value = tokens[index].text;
+            if (value === closer) depth++;
+            else if (value === opener) {
+                depth--;
+                if (depth === 0) {
+                    found = index;
+                    break;
+                }
+            }
+        }
+        if (found < 0) return undefined;
+        cursor = found - 1;
+    }
+
     while (cursor >= 0 && !BOUNDARY.has(tokens[cursor].text ?? "")) cursor--;
     const start = tokens[cursor + 1];
     const stop = tokens[endIndex];

@@ -2,6 +2,7 @@ import {
     BaseErrorListener,
     CharStream,
     CommonTokenStream,
+    PredictionMode,
     type Parser,
     ParserRuleContext,
     Token,
@@ -12,6 +13,8 @@ import type { AnnotationInfo, CallSite } from "../model.ts";
 export interface ParseOutcome<T extends ParserRuleContext, P extends Parser = Parser> {
     parser: P;
     tokens: CommonTokenStream;
+    /** 每个文件只过滤一次；调用点扫描按方法范围复用，避免逐方法复制整份 token。 */
+    visibleTokens: Token[];
     tree: T;
     errors: string[];
     text: string;
@@ -36,6 +39,47 @@ export const stripBom = (text: string): string => {
     return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 };
 
+/**
+ * 预测模式策略。
+ *
+ * 实测本仓库的 Java20 语法在 `return a.b(x)` 这种最常见的限定调用上
+ * 无法用 SLL 解析：语法树里 `expressionName`/`ambiguousName` 的右递归
+ * 让 SLL 预测选错分支，报 “mismatched input '(' expecting '.'”。
+ * 因此 SLL 只能"先试一次"，一旦发现在当前输入集合上不可用就必须停止
+ * 重复尝试——否则每个文件都要白跑一遍 SLL 再用 LL 重解析，而小文件上
+ * SLL 的耗时可以达到 LL 的 5 倍。
+ *
+ * auto：连续失败若干次后关闭 SLL；always/never 用于调试与基准对比。
+ */
+export type PredictionStrategy = "auto" | "always" | "never";
+
+/**
+ * SLL 失败几次后彻底关闭。
+ *
+ * 取 1：worker 各自持有独立状态，每个 worker 只允许浪费一次 SLL 尝试。
+ * 若取更大值，8 个 worker 会各自白跑多次（每次都要重新 lex + parse）。
+ */
+const SLL_FAILURE_LIMIT = 1;
+
+const readStrategy = (): PredictionStrategy => {
+    const raw = process.env.FEIGN_TRACER_PREDICTION?.toLowerCase();
+    if (raw === "always") return "always";
+    if (raw === "never") return "never";
+    return "auto";
+};
+
+let sllFailures = 0;
+let sllDisabled = readStrategy() === "never";
+
+/** 当前运行是否还在使用 SLL；供 CLI 汇报解析策略。 */
+export const sllEnabled = (): boolean => !sllDisabled;
+
+/** 仅供测试：重置自适应状态。 */
+export const resetPredictionMode = (): void => {
+    sllFailures = 0;
+    sllDisabled = readStrategy() === "never";
+};
+
 export const parseWith = <T extends ParserRuleContext, P extends Parser>(
     LexerClass: new (input: CharStream) => Lexer,
     ParserClass: new (input: CommonTokenStream) => P,
@@ -43,18 +87,50 @@ export const parseWith = <T extends ParserRuleContext, P extends Parser>(
     rule: (parser: P) => T,
 ): ParseOutcome<T, P> => {
     const clean = stripBom(text);
-    const lexer = new LexerClass(CharStream.fromString(clean));
-    const listener = new CollectingErrorListener();
-    lexer.removeErrorListeners();
-    lexer.addErrorListener(listener);
 
-    const tokens = new CommonTokenStream(lexer);
-    const parser = new ParserClass(tokens);
-    parser.removeErrorListeners();
-    parser.addErrorListener(listener);
+    /*
+     * 先走 SLL，失败再退回 LL。
+     *
+     * Java 等语法的方法调用表达式在 LL 模式下会产生大量全上下文预测：
+     * 一个普通文件里几十个调用就能让解析器占用上百 MB、耗时数秒。
+     * SLL 对合法 Java 代码通常给出相同语法树；一旦出现语法错误，说明
+     * 该输入需要 LL 的上下文信息，此时重新解析即可保持原有行为。
+     */
+    const parseOnce = (mode: number): ParseOutcome<T, P> => {
+        const lexer = new LexerClass(CharStream.fromString(clean));
+        const listener = new CollectingErrorListener();
+        lexer.removeErrorListeners();
+        lexer.addErrorListener(listener);
 
-    const tree = rule(parser);
-    return { parser, tokens, tree, errors: listener.errors, text: clean };
+        const tokens = new CommonTokenStream(lexer);
+        const parser = new ParserClass(tokens);
+        parser.interpreter.predictionMode = mode;
+        parser.removeErrorListeners();
+        parser.addErrorListener(listener);
+
+        const tree = rule(parser);
+        return {
+            parser,
+            tokens,
+            visibleTokens: visibleTokens(tokens),
+            tree,
+            errors: listener.errors,
+            text: clean,
+        };
+    };
+
+    if (!sllDisabled) {
+        const fast = parseOnce(PredictionMode.SLL);
+        // SLL 的语义保证：要么给出与 LL 相同的树，要么报语法错误。
+        if (fast.errors.length === 0) {
+            sllFailures = 0;
+            return fast;
+        }
+        sllFailures++;
+        if (sllFailures >= SLL_FAILURE_LIMIT) sllDisabled = true;
+    }
+
+    return parseOnce(PredictionMode.LL);
 };
 
 export const ruleName = (parser: Parser, ctx: ParserRuleContext): string => {
@@ -173,13 +249,27 @@ export const splitTopLevel = (input: string, separator = ","): string[] => {
     return result;
 };
 
+/**
+ * 注解名统一归约为简单名。
+ *
+ * Java/Kotlin 允许写全限定名（`@org.springframework.stereotype.Service`），
+ * 而下游所有识别逻辑（`hasAnnotation`、端点映射表、`kindOf`）都按简单名匹配，
+ * 不归约就会出现「写法不同、识别结果不同」。`raw` 仍保留原文。
+ */
+const annotationName = (name: string): string => {
+    const trimmed = name.trim();
+    const dot = trimmed.lastIndexOf(".");
+    return dot < 0 ? trimmed : trimmed.slice(dot + 1);
+};
+
 export const parseAnnotation = (rawText: string): AnnotationInfo => {
     let raw = rawText.trim();
     if (raw.startsWith("@")) raw = raw.slice(1);
 
     const paren = raw.indexOf("(");
     if (paren < 0) {
-        return { name: raw.trim(), raw: `@${raw.trim()}`, args: {} };
+        const text = raw.trim();
+        return { name: annotationName(text), raw: `@${text}`, args: {} };
     }
 
     const name = raw.slice(0, paren).trim();
@@ -206,7 +296,7 @@ export const parseAnnotation = (rawText: string): AnnotationInfo => {
         });
     }
 
-    return { name, raw: `@${name}${raw.slice(paren)}`, args };
+    return { name: annotationName(name), raw: `@${name}${raw.slice(paren)}`, args };
 };
 
 const topLevelEquals = (input: string): number => {

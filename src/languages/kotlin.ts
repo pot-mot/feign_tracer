@@ -30,7 +30,6 @@ import {
     type ParseOutcome,
 } from "./common.ts";
 import { KEYWORDS, scanTokenCalls } from "./callscan.ts";
-import { visibleTokens } from "./common.ts";
 
 const TYPE_RULES = new Set(["classDeclaration", "objectDeclaration", "companionObject"]);
 
@@ -63,7 +62,7 @@ export const parseKotlinFile = (
     }
 
     for (const importCtx of findEvery(outcome, outcome.tree, "importHeader")) {
-        file.imports.push(parseKotlinImport(textOf(importCtx)));
+        file.imports.push(parseKotlinImport(outcome, importCtx));
     }
 
     collectTypes(outcome, outcome.tree, file, undefined, moduleId);
@@ -94,20 +93,29 @@ const findEvery = (
     return found;
 };
 
-const parseKotlinImport = (text: string): ImportInfo => {
-    let value = text
-        .replace(/^import/, "")
-        .replace(/;$/, "")
-        .trim();
-    let alias: string | undefined;
-    const asMatch = value.match(/\s+as\s+([A-Za-z_][\w]*)$/);
-    if (asMatch) {
-        alias = asMatch[1];
-        value = value.slice(0, asMatch.index).trim();
-    }
-    const wildcard = value.endsWith(".*") || value.endsWith("*");
-    if (wildcard) value = value.replace(/\.?\*$/, "");
-    return { name: value, alias, static: false, wildcard };
+/**
+ * Kotlin 导入。
+ *
+ * 别名必须从 AST 读取：`textOf()` 会丢掉 token 之间的空格，
+ * `import a.b.Tools as Toolkit` 会被粘成 `a.b.ToolsasToolkit`，无法再切回
+ * 「名字 + as + 别名」——类名本身也可能以 `as` 结尾，靠文本无法消歧。
+ */
+const parseKotlinImport = (
+    outcome: ParseOutcome<ParserRuleContext>,
+    ctx: ParserRuleContext,
+): ImportInfo => {
+    const nameCtx = firstChildRule(outcome.parser, ctx, "identifier");
+    const aliasCtx = firstChildRule(outcome.parser, ctx, "importAlias");
+    const source = textOf(nameCtx);
+    // 通配导入在语法里是 `DOT MULT`，getText 后表现为结尾的 `*`。
+    const wildcard = textOf(ctx).replace(/;$/, "").trim().endsWith("*");
+    const alias = aliasCtx ? textOf(aliasCtx).replace(/^as/, "") : undefined;
+    return {
+        name: source,
+        alias: alias && alias.length > 0 ? alias : undefined,
+        static: false,
+        wildcard,
+    };
 };
 
 const collectTypes = (
@@ -483,7 +491,7 @@ const extractCalls = (
     body: ParserRuleContext,
 ): CallSite[] => {
     return scanTokenCalls({
-        tokens: visibleTokens(outcome.tokens),
+        tokens: outcome.visibleTokens,
         source: outcome.text,
         startTokenIndex: body.start?.tokenIndex ?? 0,
         endTokenIndex: body.stop?.tokenIndex ?? 0,

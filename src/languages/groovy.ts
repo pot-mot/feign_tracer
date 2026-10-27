@@ -27,7 +27,6 @@ import {
     simpleTypeName,
     startOffset,
     textOf,
-    visibleTokens,
     type ParseOutcome,
 } from "./common.ts";
 import { KEYWORDS, scanTokenCalls } from "./callscan.ts";
@@ -68,15 +67,16 @@ export const parseGroovyFile = (
     return file;
 };
 
+/** `textOf()` 不保留空格，`import static a.b.C.d` 会粘连，不能用 `"static "` 判断。 */
 const parseGroovyImport = (text: string): ImportInfo => {
     let value = text
         .replace(/^import/, "")
         .replace(/;$/, "")
         .trim();
     let isStatic = false;
-    if (value.startsWith("static ")) {
+    if (value.startsWith("static")) {
         isStatic = true;
-        value = value.slice(7).trim();
+        value = value.slice("static".length).trim();
     }
     const wildcard = value.endsWith(".*") || value.endsWith("*");
     if (wildcard) value = value.replace(/\.?\*$/, "");
@@ -207,6 +207,9 @@ const extractMethod = (
 
     const name = textOf(nameCtx) || "<anonymous>";
     const params = paramsCtx ? extractParams(outcome, paramsCtx) : [];
+    // Groovy 构造器没有返回类型，方法名与类名相同；否则会退化成普通方法，
+    // `new Foo(...)` 永远解析不到目标。
+    const isConstructor = typeCtx === undefined && name === typeInfo.name;
 
     return {
         id: `${typeInfo.fqn}#${name}/${params.length}`,
@@ -216,7 +219,7 @@ const extractMethod = (
         ownerKind: typeInfo.kind,
         annotations,
         modifiers,
-        returnType: textOf(typeCtx) || "def",
+        returnType: isConstructor ? typeInfo.name : textOf(typeCtx) || "def",
         params,
         line: lineOf(ctx),
         endLine: block ? endLineOf(block) : lineOf(ctx),
@@ -224,7 +227,7 @@ const extractMethod = (
         bodyEnd: block ? endOffset(block) : undefined,
         calls: block ? scanGroovyCalls(outcome, block) : [],
         locals: block ? scanGroovyLocals(textOf(block), lineOf(block), params) : [],
-        isConstructor: false,
+        isConstructor,
         isAbstract: !block,
     };
 };
@@ -273,7 +276,7 @@ const scanGroovyCalls = (
     block: ParserRuleContext,
 ): CallSite[] => {
     return scanTokenCalls({
-        tokens: visibleTokens(outcome.tokens),
+        tokens: outcome.visibleTokens,
         source: outcome.text,
         startTokenIndex: block.start?.tokenIndex ?? 0,
         endTokenIndex: block.stop?.tokenIndex ?? 0,

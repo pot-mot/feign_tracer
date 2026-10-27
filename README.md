@@ -182,6 +182,8 @@ feign-tracer <root-directory> [options]
     --rebuild-dir <dir>   只重建该目录下的端点，并跳过该目录的解析缓存
     --no-cache            关闭解析缓存
     --cache-dir <dir>     解析缓存目录                      [.feign-tracer-cache]
+    --no-work-db          方法体不落临时工作库，全部留在内存（仅适合小项目）
+    --jobs <n>            解析线程数：0 = 自动，1 = 单线程            [0]
     --fresh               重建数据库，不合并增量结果
     --list-endpoints      打印端点/方法链及构建状态
     --hide-params         控制台调用树隐藏参数列表
@@ -203,6 +205,24 @@ npx tsx src/cli.ts examples/shop --print-trees --exclude-self-calls
 npx tsx src/cli.ts examples/gradle-shop --db gradle.db --class-filter "Controller$,Service$"
 npx tsx src/cli.ts examples/shop --format both --db out/shop.db --out out/shop.json
 ```
+
+## 内存模型
+
+大项目（几百个文件、十万级调用点）的内存峰值主要来自三处，代码里分别做了处理：
+
+1. **方法体（`calls` / `locals`）**：解析完一个文件就转存到临时 SQLite 工作库
+   （按 `method_id` 一行，`calls_json` / `locals_json`），然后从内存结构里剥离。
+   之后调用链展开、依赖边统计、`resolvedCalls` 统计都通过
+   `ProjectIndex.callsOf()` / `localsOf()` 按需读取，带 2048 条 LRU。
+   工作库在分析结束时自动删除，不进入输出。`--no-work-db` 可关闭该行为。
+2. **解析并发**：worker 采用"完成一个就领下一个"的逐文件派发，不再按文件数静态分批，
+   每个 worker 的堆上最多只有正在解析的那一个文件；worker 异常时只补跑未交付的文件，
+   不会重复计入模块文件数或工作库。
+3. **调用树**：`--format sqlite` 下逐端点展开后立即写入临时 NDJSON 暂存文件并从内存释放，
+   写库时再流式读回插入 `call_nodes`，常驻内存只与"当前正在展开的根"有关。
+
+`--format json` / `--format both` / `--stdout` / `--print-trees` 仍然需要在内存里保留完整
+调用树，大项目上这几种输出方式的内存占用会明显高于默认的 SQLite 输出。
 
 ## SQLite 存储
 
@@ -432,8 +452,30 @@ src/
   languages/               Java / Kotlin / Groovy 结构提取与调用扫描
   graph/                   索引、解析、端点、调用树、方法链、文件依赖
   store/sqlite.ts          SQLite 持久化、增量合并与表结构
+  store/bodies.ts          方法体临时工作库（落盘 + LRU 懒加载）
+  store/tree-spool.ts      调用树暂存文件（流式写库）
   cli.ts                   命令行入口
   generated/               生成的 ANTLR TypeScript parser
+tests/                     识别结果回归（提取 / 解析 / 调用树 / 快照 / 落库）
+tests/fixtures/            示例工程的特征快照
 web/                       Vite Web UI
 examples/                  示例工程（Maven / Gradle / Groovy / 多实现与循环调用）
 ```
+
+## 回归测试
+
+```bash
+npm run test:unit    # 提取、解析、调用树状态、落库状态、快照
+npm test             # 单测 + examples/shop 端到端
+npm run test:cycles  # 递归调用示例，校验 cyclic 标记
+```
+
+`tests/snapshot.test.ts` 把 `examples/` 下三个工程的分析结果固化成
+`tests/fixtures/*.snapshot.json`（只保留端点、调用树与状态标记、Feign 关联、
+文件依赖、模块边和统计，剔除时间戳与耗时）。改动识别逻辑后，如果快照失配：
+
+```bash
+UPDATE_SNAPSHOT=1 npx tsx --test tests/snapshot.test.ts
+```
+
+重新生成后**必须人工 review diff**，确认变化是本次改动预期的结果。

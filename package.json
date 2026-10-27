@@ -20,7 +20,7 @@
         "start": "node dist/cli.js",
         "sample": "tsx src/cli.ts examples/shop --format both --db examples/shop-result.db --out examples/shop-result.json",
         "test": "npm run test:unit && tsx src/cli.ts examples/shop --format both --db .tmp/shop-result.db --out .tmp/shop-result.json --quiet",
-        "test:unit": "tsx --test tests/analyze.test.ts tests/parse-file.test.ts tests/parse-pool.test.ts tests/scan.test.ts",
+        "test:unit": "tsx --test tests/extraction.test.ts tests/resolution.test.ts tests/calltree.test.ts tests/snapshot.test.ts tests/store.test.ts tests/analyze.test.ts tests/bodies.test.ts tests/parse-file.test.ts tests/parse-pool.test.ts tests/scan.test.ts",
         "test:cycles": "tsx src/cli.ts examples/cycles --format both --db .tmp/cycles-result.db --out .tmp/cycles-result.json --class-name CycleService --method-name a --quiet"
     },
     "keywords": [

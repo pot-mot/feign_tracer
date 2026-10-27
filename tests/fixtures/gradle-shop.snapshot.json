@@ -1,0 +1,157 @@
+{
+    "stats": {
+        "filesScanned": 5,
+        "sourceFiles": 2,
+        "javaFiles": 1,
+        "kotlinFiles": 1,
+        "groovyFiles": 0,
+        "buildFiles": 3,
+        "modules": 3,
+        "types": 3,
+        "methods": 3,
+        "calls": 2,
+        "resolvedCalls": 2,
+        "endpoints": 1,
+        "endpointsBuilt": 1,
+        "traces": 0,
+        "tracesBuilt": 0,
+        "feignClients": 0,
+        "feignOperations": 0,
+        "parseErrors": 0
+    },
+    "modules": [
+        {
+            "id": ":app",
+            "name": "app",
+            "buildTool": "gradle",
+            "dir": "app",
+            "fileCount": 1,
+            "dependencies": [
+                {
+                    "to": ":lib",
+                    "external": false
+                },
+                {
+                    "to": ":lib",
+                    "external": false
+                },
+                {
+                    "artifactId": "spring-boot-starter-web",
+                    "external": true
+                },
+                {
+                    "artifactId": "spring-cloud-dependencies",
+                    "external": true
+                }
+            ]
+        },
+        {
+            "id": ":lib",
+            "name": "lib",
+            "buildTool": "gradle",
+            "dir": "lib",
+            "fileCount": 1,
+            "dependencies": [
+                {
+                    "artifactId": "commons-lang3",
+                    "external": true
+                }
+            ]
+        },
+        {
+            "id": ":",
+            "name": "gradle-shop",
+            "buildTool": "gradle",
+            "dir": "",
+            "fileCount": 0,
+            "dependencies": []
+        }
+    ],
+    "moduleEdges": [
+        [
+            ":app",
+            ":lib",
+            2
+        ]
+    ],
+    "endpoints": [
+        {
+            "id": "GET /demo/hello",
+            "httpMethod": "GET",
+            "paths": [
+                "/demo/hello"
+            ],
+            "handler": "com.example.app.DemoController#hello/1",
+            "handlerLabel": "DemoController.hello(name)",
+            "controller": "com.example.app.DemoController",
+            "moduleId": ":app",
+            "file": "app/src/main/kotlin/com/example/app/DemoController.kt",
+            "line": 13,
+            "treeBuilt": true,
+            "tree": {
+                "seq": "0",
+                "label": "DemoController.hello(name)",
+                "kind": "controller",
+                "depth": 0,
+                "children": [
+                    {
+                        "seq": "0-0",
+                        "label": "DemoService.hello(name)",
+                        "kind": "service",
+                        "depth": 1,
+                        "children": []
+                    }
+                ]
+            }
+        }
+    ],
+    "traces": [],
+    "feignClients": [],
+    "feignOperations": [],
+    "files": [
+        {
+            "path": "lib/src/main/java/com/example/lib/Greeter.java",
+            "language": "java",
+            "moduleId": ":lib",
+            "packageName": "com.example.lib",
+            "imports": [],
+            "types": [
+                "com.example.lib.Greeter"
+            ],
+            "calls": 0,
+            "parseErrors": 0,
+            "dependencies": []
+        },
+        {
+            "path": "app/src/main/kotlin/com/example/app/DemoController.kt",
+            "language": "kotlin",
+            "moduleId": ":app",
+            "packageName": "com.example.app",
+            "imports": [
+                "com.example.lib.Greeter",
+                "org.springframework.web.bind.annotation.GetMapping",
+                "org.springframework.web.bind.annotation.RequestMapping",
+                "org.springframework.web.bind.annotation.RequestParam",
+                "org.springframework.web.bind.annotation.RestController"
+            ],
+            "types": [
+                "com.example.app.DemoController",
+                "com.example.app.DemoService"
+            ],
+            "calls": 2,
+            "parseErrors": 0,
+            "dependencies": [
+                {
+                    "to": "lib/src/main/java/com/example/lib/Greeter.java",
+                    "kinds": [
+                        "import",
+                        "field",
+                        "call"
+                    ],
+                    "count": 3
+                }
+            ]
+        }
+    ],
+    "warnings": []
+}

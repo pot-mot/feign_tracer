@@ -1,6 +1,8 @@
 import type {
     AnnotationInfo,
+    CallSite,
     ImportInfo,
+    LocalVar,
     MethodInfo,
     ModuleInfo,
     NodeKind,
@@ -8,6 +10,20 @@ import type {
     TypeInfo,
 } from "../model.ts";
 import { getAnnotation, hasAnnotation, simpleTypeName } from "../languages/common.ts";
+
+/**
+ * 方法体来源。解析阶段结束后方法体的原始数据可能已经不在 `MethodInfo`
+ * 上（大项目会转到工作库），调用链解析统一通过这里读取，从而不需要
+ * 关心方法体当前在内存还是磁盘。
+ */
+export interface MethodBodySource {
+    readonly load: (
+        methodId: string,
+    ) => { readonly calls: readonly CallSite[]; readonly locals: readonly LocalVar[] } | undefined;
+}
+
+const EMPTY_CALLS: readonly CallSite[] = [];
+const EMPTY_LOCALS: readonly LocalVar[] = [];
 
 export interface ProjectIndex {
     readonly files: readonly ParsedFile[];
@@ -21,6 +37,12 @@ export interface ProjectIndex {
     readonly modules: readonly ModuleInfo[];
     readonly moduleById: ReadonlyMap<string, ModuleInfo>;
     readonly moduleByName: ReadonlyMap<string, ModuleInfo>;
+    /** 方法体中的调用点；方法体已被剥离时从 `bodies` 读取。 */
+    readonly callsOf: (method: MethodInfo) => readonly CallSite[];
+    /** 方法体中的局部变量；读取路径与 `callsOf` 相同。 */
+    readonly localsOf: (method: MethodInfo) => readonly LocalVar[];
+    /** 含继承字段的 `字段名 -> 类型` 视图，按类型记忆化。 */
+    readonly fieldTypesOf: (type: TypeInfo) => ReadonlyMap<string, string>;
     readonly resolveType: (
         rawName: string | undefined,
         file: ParsedFile | undefined,
@@ -55,8 +77,15 @@ export const flattenTypes = (types: readonly TypeInfo[]): TypeInfo[] => {
 /**
  * 项目类型/方法索引。构造阶段只建立 Map，之后对外暴露只读视图；
  * 调用链解析只依赖查询函数，不直接修改索引内容。
+ *
+ * `bodies` 省略时方法体直接取自 `MethodInfo.calls/locals`（小项目与测试
+ * 路径）；提供时方法体按需从工作库加载，索引里只保留轻量符号信息。
  */
-export const createProjectIndex = (files: ParsedFile[], modules: ModuleInfo[]): ProjectIndex => {
+export const createProjectIndex = (
+    files: ParsedFile[],
+    modules: ModuleInfo[],
+    bodies?: MethodBodySource,
+): ProjectIndex => {
     const fileByPath = new Map<string, ParsedFile>();
     const typesByFqn = new Map<string, TypeInfo>();
     const typesByName = new Map<string, TypeInfo[]>();
@@ -194,6 +223,48 @@ export const createProjectIndex = (files: ParsedFile[], modules: ModuleInfo[]): 
         return [type];
     };
 
+    /*
+     * 方法体读取：优先用内存字段，其次查工作库。缓存结果为只读数组，
+     * 调用方不得修改，避免和工作库中的副本产生分歧。
+     */
+    const callsOf = (method: MethodInfo): readonly CallSite[] =>
+        method.calls ?? bodies?.load(method.id)?.calls ?? EMPTY_CALLS;
+
+    const localsOf = (method: MethodInfo): readonly LocalVar[] =>
+        method.locals ?? bodies?.load(method.id)?.locals ?? EMPTY_LOCALS;
+
+    /*
+     * 字段类型按类型记忆化。buildEnvironment 原先对每个方法都重新沿继承链
+     * 收集一遍字段，方法数上万时会退化成 O(methods × supers)。
+     */
+    const fieldTypeCache = new Map<string, ReadonlyMap<string, string>>();
+
+    const collectFieldTypes = (
+        type: TypeInfo,
+        result: Map<string, string>,
+        visited: Set<string>,
+    ): void => {
+        if (visited.has(type.fqn)) return;
+        visited.add(type.fqn);
+        for (const field of type.fields) {
+            if (!result.has(field.name)) result.set(field.name, field.type);
+        }
+        const ownerFile = fileByPath.get(type.filePath);
+        for (const superName of type.superTypes) {
+            const superType = resolveType(superName, ownerFile, type);
+            if (superType) collectFieldTypes(superType, result, visited);
+        }
+    };
+
+    const fieldTypesOf = (type: TypeInfo): ReadonlyMap<string, string> => {
+        const cached = fieldTypeCache.get(type.fqn);
+        if (cached) return cached;
+        const collected = new Map<string, string>();
+        collectFieldTypes(type, collected, new Set());
+        fieldTypeCache.set(type.fqn, collected);
+        return collected;
+    };
+
     const moduleOf = (filePath: string): ModuleInfo | undefined => {
         let best: ModuleInfo | undefined;
         for (const module of modules) {
@@ -296,6 +367,9 @@ export const createProjectIndex = (files: ParsedFile[], modules: ModuleInfo[]): 
         modules,
         moduleById,
         moduleByName,
+        callsOf,
+        localsOf,
+        fieldTypesOf,
         resolveType,
         resolveImport,
         methodsOf,

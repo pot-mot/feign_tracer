@@ -28,7 +28,6 @@ import {
     startOffset,
     textOf,
     tokenIndexRange,
-    visibleTokens,
     walkTree,
     type ParseOutcome,
 } from "./common.ts";
@@ -124,15 +123,20 @@ const findAllByRule = (
     return found;
 };
 
+/**
+ * `textOf()` 不保留 token 之间的空格，`import static a.b.C.d;` 会变成
+ * `importstatica.b.C.d;`，因此不能用 `"static "` 判断静态导入。
+ * Java 里 `static` 是关键字，且只能紧跟在 `import` 之后，用前缀判断是安全的。
+ */
 const parseJavaImport = (text: string): ImportInfo => {
     let value = text
         .replace(/^import/, "")
         .replace(/;$/, "")
         .trim();
     let isStatic = false;
-    if (value.startsWith("static ")) {
+    if (value.startsWith("static")) {
         isStatic = true;
-        value = value.slice(7).trim();
+        value = value.slice("static".length).trim();
     }
     const wildcard = value.endsWith(".*") || value.endsWith("*");
     if (wildcard) value = value.replace(/\.?\*$/, "");
@@ -483,7 +487,7 @@ const extractCalls = (
 ): CallSite[] => {
     const [start, end] = tokenIndexRange(body);
     return scanTokenCalls({
-        tokens: visibleTokens(outcome.tokens),
+        tokens: outcome.visibleTokens,
         source: outcome.text,
         startTokenIndex: start,
         endTokenIndex: end,

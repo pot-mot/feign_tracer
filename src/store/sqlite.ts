@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import sqlite3 from "node-sqlite3-wasm";
 import type { Database as DatabaseType, Statement as StatementType } from "node-sqlite3-wasm";
 import type { AnalysisResult, CallTreeNode, ModuleDependency } from "../model.ts";
 import type { DeepReadonly } from "../types.ts";
+import { readTreeSpool } from "./tree-spool.ts";
 
 const { Database } = sqlite3;
 
@@ -309,6 +310,11 @@ export interface SqliteWriteResult {
 export interface SqliteWriteOptions {
     /** 保留本次未重建端点的调用树；增量/目录重建模式依赖该选项。 */
     readonly merge?: boolean;
+    /**
+     * 调用树暂存文件。提供后 `call_nodes` 从该文件流式读取，
+     * 而不是遍历 `result.endpoints[].tree`——后者要求所有端点的树同时驻留内存。
+     */
+    readonly treeSpool?: string;
 }
 
 /**
@@ -322,26 +328,30 @@ export const writeAnalysisToSqlite = (
 ): SqliteWriteResult => {
     const dbPath = resolve(targetPath);
     mkdirSync(dirname(dbPath), { recursive: true });
-    if (options.merge && existsSync(dbPath)) return mergeAnalysis(result, dbPath);
-    return createAnalysis(result, dbPath);
+    if (options.merge && existsSync(dbPath))
+        return mergeAnalysis(result, dbPath, options.treeSpool);
+    return createAnalysis(result, dbPath, options.treeSpool);
 };
 
 const createAnalysis = (
     result: DeepReadonly<AnalysisResult>,
     dbPath: string,
+    treeSpool: string | undefined,
 ): SqliteWriteResult => {
     const tempPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
     const db = new Database(tempPath);
     try {
-        db.exec("PRAGMA journal_mode = MEMORY");
+        // 目标是临时文件，崩溃直接丢弃即可，因此关掉回滚日志与临时页的内存占用。
+        db.exec("PRAGMA journal_mode = OFF");
         db.exec("PRAGMA synchronous = OFF");
-        db.exec("PRAGMA temp_store = MEMORY");
+        db.exec("PRAGMA temp_store = FILE");
+        db.exec("PRAGMA cache_size = -32768");
         db.exec(SCHEMA);
 
         const statements = prepareStatements(db);
         db.exec("BEGIN");
         try {
-            insertAnalysis(statements, result);
+            insertAnalysis(statements, result, treeSpool);
             db.exec("COMMIT");
         } catch (error) {
             try {
@@ -357,7 +367,11 @@ const createAnalysis = (
         finalizeStatements(statements);
         db.close();
 
-        rmSync(dbPath, { force: true });
+        /*
+         * 直接 rename 覆盖目标文件：POSIX rename 与 Windows
+         * MoveFileEx(REPLACE_EXISTING) 都是原子替换。
+         * 先 delete 再 rename 反而会留下一个「目标文件不存在」的窗口。
+         */
         renameSync(tempPath, dbPath);
         return { path: dbPath, bytes: statSync(dbPath).size, rowCounts };
     } catch (error) {
@@ -366,18 +380,26 @@ const createAnalysis = (
         } catch {
             // 忽略失败写入时的关闭错误
         }
-        rmSync(tempPath, { force: true });
+        try {
+            unlinkSync(tempPath);
+        } catch {
+            // 临时文件可能从未创建成功，忽略。
+        }
         throw error;
     }
 };
 
-const mergeAnalysis = (result: DeepReadonly<AnalysisResult>, dbPath: string): SqliteWriteResult => {
+const mergeAnalysis = (
+    result: DeepReadonly<AnalysisResult>,
+    dbPath: string,
+    treeSpool: string | undefined,
+): SqliteWriteResult => {
     const db = new Database(dbPath);
     try {
         if (migrateSchema(db) === "recreate") {
+            // 旧库结构无法原地升级：关闭连接后整库重建，由 createAnalysis 原子替换。
             db.close();
-            rmSync(dbPath, { force: true });
-            return createAnalysis(result, dbPath);
+            return createAnalysis(result, dbPath, treeSpool);
         }
 
         db.exec("PRAGMA synchronous = NORMAL");
@@ -423,7 +445,7 @@ const mergeAnalysis = (result: DeepReadonly<AnalysisResult>, dbPath: string): Sq
             );
 
             for (const table of METADATA_TABLES) db.exec(`DELETE FROM ${table}`);
-            insertAnalysis(statements, result);
+            insertAnalysis(statements, result, treeSpool);
             db.exec("INSERT INTO traces SELECT * FROM preserved_trace");
 
             // 未重建的根保留之前构建的树。
@@ -662,6 +684,7 @@ const prepareStatements = (db: DatabaseType): InsertStatements => {
 const insertAnalysis = (
     statements: InsertStatements,
     result: DeepReadonly<AnalysisResult>,
+    treeSpool: string | undefined,
 ): void => {
     const { meta, stats } = result;
     statements.analysis.run([
@@ -721,7 +744,7 @@ const insertAnalysis = (
             endpoint.line ?? null,
             endpoint.treeBuilt ? 1 : 0,
         ]);
-        if (endpoint.treeBuilt) {
+        if (endpoint.treeBuilt && !treeSpool) {
             insertCallTree(statements.callNode, "endpoint", endpoint.id, endpoint.tree);
         }
     }
@@ -739,9 +762,16 @@ const insertAnalysis = (
             trace.implementationOf ?? null,
             trace.treeBuilt ? 1 : 0,
         ]);
-        if (trace.treeBuilt) {
+        if (trace.treeBuilt && !treeSpool) {
             insertCallTree(statements.callNode, "trace", trace.id, trace.tree);
         }
+    }
+
+    // 调用树单独流式写入：整棵树在上一步已经落到暂存文件，这里只保留一行的内存开销。
+    if (treeSpool) {
+        readTreeSpool(treeSpool, (record) => {
+            insertCallNode(statements.callNode, record.rootType, record.id, record.node);
+        });
     }
 
     const clientIdByKey = new Map<string, string>();
@@ -843,46 +873,53 @@ const insertCallTree = (
     while (stack.length > 0) {
         const node = stack.pop();
         if (!node) break;
-        const parentSeq = node.seq.includes("-")
-            ? node.seq.slice(0, node.seq.lastIndexOf("-"))
-            : undefined;
-        const sortKey = node.seq
-            .split("-")
-            .map((part) => part.padStart(4, "0"))
-            .join(".");
-
-        statement.run([
-            rootType,
-            endpointId,
-            node.seq,
-            node.path,
-            sortKey,
-            parentSeq ?? null,
-            node.order,
-            node.depth,
-            node.id,
-            node.label,
-            node.signature ?? null,
-            node.params && node.params.length > 0 ? JSON.stringify(node.params) : null,
-            node.visibility ?? null,
-            node.kind,
-            node.moduleId ?? null,
-            node.file ?? null,
-            node.line ?? null,
-            node.annotations && node.annotations.length > 0
-                ? JSON.stringify(node.annotations)
-                : null,
-            node.callCount ?? 1,
-            node.unresolved ? 1 : 0,
-            node.cyclic ? 1 : 0,
-            node.implementationOf ?? null,
-            node.feign?.service ?? null,
-            node.feign?.httpMethod ?? null,
-            node.feign?.path ?? null,
-            node.remote?.endpoint ?? null,
-            node.remote?.service ?? null,
-        ]);
-
+        insertCallNode(statement, rootType, endpointId, node);
         for (const child of node.children) stack.push(child);
     }
+};
+
+/** 单行写入。暂存文件读取路径与内存树路径共用，保证两种模式产生完全相同的行。 */
+const insertCallNode = (
+    statement: Statement,
+    rootType: "endpoint" | "trace",
+    endpointId: string,
+    node: DeepReadonly<CallTreeNode>,
+): void => {
+    const parentSeq = node.seq.includes("-")
+        ? node.seq.slice(0, node.seq.lastIndexOf("-"))
+        : undefined;
+    const sortKey = node.seq
+        .split("-")
+        .map((part) => part.padStart(4, "0"))
+        .join(".");
+
+    statement.run([
+        rootType,
+        endpointId,
+        node.seq,
+        node.path,
+        sortKey,
+        parentSeq ?? null,
+        node.order,
+        node.depth,
+        node.id,
+        node.label,
+        node.signature ?? null,
+        node.params && node.params.length > 0 ? JSON.stringify(node.params) : null,
+        node.visibility ?? null,
+        node.kind,
+        node.moduleId ?? null,
+        node.file ?? null,
+        node.line ?? null,
+        node.annotations && node.annotations.length > 0 ? JSON.stringify(node.annotations) : null,
+        node.callCount ?? 1,
+        node.unresolved ? 1 : 0,
+        node.cyclic ? 1 : 0,
+        node.implementationOf ?? null,
+        node.feign?.service ?? null,
+        node.feign?.httpMethod ?? null,
+        node.feign?.path ?? null,
+        node.remote?.endpoint ?? null,
+        node.remote?.service ?? null,
+    ]);
 };

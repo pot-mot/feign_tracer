@@ -20,6 +20,19 @@ export interface CallTreeOptions {
     readonly classFilters: readonly RegExp[];
 }
 
+export type CallTreeRootType = "endpoint" | "trace";
+
+/**
+ * 调用树写出目标。提供后每个根的树在展开完成时立刻外写并从内存释放，
+ * 因此常驻内存只与「当前正在展开的那一个根」有关，而不是全部端点之和。
+ */
+export interface CallTreeSink {
+    readonly begin: (rootType: CallTreeRootType, id: string) => void;
+    /** 按前序逐个写入节点；节点的 `children` 由 sink 自行忽略。 */
+    readonly write: (node: CallTreeNode, rootType: CallTreeRootType, id: string) => void;
+    readonly end: () => void;
+}
+
 interface TreeContext {
     index: ProjectIndex;
     options: CallTreeOptions;
@@ -34,6 +47,7 @@ export const buildCallTrees = (
     feignOperations: FeignOperation[],
     options: CallTreeOptions,
     remoteEndpoints: EndpointInfo[] = endpoints,
+    sink?: CallTreeSink,
 ): void => {
     const context = createContext(index, remoteEndpoints, feignOperations, options);
     const callCache = new Map<string, ResolvedCall[]>();
@@ -44,6 +58,7 @@ export const buildCallTrees = (
         const ancestors = new Set<string>([handler.id]);
         endpoint.tree.children = expandMethod(context, callCache, handler, "0", 0, ancestors);
         endpoint.treeBuilt = true;
+        drainTree(endpoint.tree, "endpoint", endpoint.id, sink);
     }
 };
 
@@ -55,6 +70,7 @@ export const buildTraceTrees = (
     feignOperations: FeignOperation[],
     options: CallTreeOptions,
     remoteEndpoints: EndpointInfo[] = endpoints,
+    sink?: CallTreeSink,
 ): void => {
     if (traces.length === 0) return;
     const context = createContext(index, remoteEndpoints, feignOperations, options);
@@ -66,7 +82,33 @@ export const buildTraceTrees = (
         const ancestors = new Set<string>([handler.id]);
         trace.tree.children = expandMethod(context, callCache, handler, "0", 0, ancestors);
         trace.treeBuilt = true;
+        drainTree(trace.tree, "trace", trace.id, sink);
     }
+};
+
+/**
+ * 把一棵已展开完的树交给 sink 后清空子节点。
+ *
+ * 采用前序遍历：`seq` 本身编码了路径，父节点先写即可满足父先于子的顺序，
+ * 落库后按 `sort_key` 排序不受写入顺序影响。
+ */
+const drainTree = (
+    root: CallTreeNode,
+    rootType: CallTreeRootType,
+    id: string,
+    sink: CallTreeSink | undefined,
+): void => {
+    if (!sink) return;
+    sink.begin(rootType, id);
+    const stack: CallTreeNode[] = [root];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node) break;
+        sink.write(node, rootType, id);
+        for (const child of node.children) stack.push(child);
+    }
+    sink.end();
+    root.children = [];
 };
 
 const createContext = (
@@ -91,6 +133,28 @@ const createContext = (
     };
 };
 
+/**
+ * 解析结果缓存上限。
+ *
+ * 缓存能让共享的下层方法在多个端点之间只解析一次，但条目本身持有
+ * `CallSite` 引用——无限增长会把方法体又拉回内存，抵消工作库的作用。
+ * 因此超过上限直接整体丢弃，用重新解析换取内存上限。
+ */
+const CALL_CACHE_LIMIT = 4096;
+
+const readCalls = (
+    cache: Map<string, ResolvedCall[]>,
+    index: ProjectIndex,
+    method: MethodInfo,
+): ResolvedCall[] => {
+    const cached = cache.get(method.id);
+    if (cached) return cached;
+    const resolved = resolveCalls(index, method);
+    if (cache.size >= CALL_CACHE_LIMIT) cache.clear();
+    cache.set(method.id, resolved);
+    return resolved;
+};
+
 const expandMethod = (
     context: TreeContext,
     cache: Map<string, ResolvedCall[]>,
@@ -101,11 +165,7 @@ const expandMethod = (
 ): CallTreeNode[] => {
     if (depth >= context.options.maxDepth || context.nodeBudget <= 0) return [];
 
-    let resolved = cache.get(method.id);
-    if (!resolved) {
-        resolved = resolveCalls(context.index, method);
-        cache.set(method.id, resolved);
-    }
+    const resolved = readCalls(cache, context.index, method);
 
     const children: CallTreeNode[] = [];
     const byTarget = new Map<string, CallTreeNode>();

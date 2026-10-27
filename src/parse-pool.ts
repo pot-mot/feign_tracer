@@ -6,8 +6,12 @@ import { Worker } from "node:worker_threads";
 import type { ParseCacheOptions } from "./cache.ts";
 import { createParseCache } from "./cache.ts";
 import type { ParsedFile } from "./model.ts";
-import { parseTasksInline, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
-import { isParseWorkerResponse, type ParseBatchRequest } from "./parse-protocol.ts";
+import { parseTask, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
+import {
+    isParseWorkerResponse,
+    type ParseTaskRequest,
+    type ParseWorkerData,
+} from "./parse-protocol.ts";
 
 /** 自动模式下最多使用 8 个 worker，避免大机器上内存和语法初始化开销失控。 */
 const MAX_AUTO_JOBS = 8;
@@ -19,17 +23,19 @@ const MAX_AUTO_JOBS = 8;
  */
 const MIN_FILES_PER_WORKER = 24;
 
-const MIN_BATCH_SIZE = 4;
-const MAX_BATCH_SIZE = 64;
-
 export interface ParsePoolOptions extends ParseCacheOptions {
     /** 0 表示按 CPU 核数自动选择，1 表示禁用并行。 */
     readonly jobs?: number;
     readonly onProgress?: (completed: number, total: number) => void;
+    /**
+     * 逐文件交付回调。提供后解析结果不再累积，内存里只保留「在途」的文件；
+     * 此时返回值中的 `outcomes` / `parsed` 为空数组。
+     */
+    readonly onFile?: (index: number, outcome: ParseTaskOutcome) => void;
 }
 
 export interface ParsePoolResult {
-    /** 与输入任务一一对应，供 analyze 侧统一合并警告和模块计数。 */
+    /** 与输入任务一一对应；使用 `onFile` 时为空。 */
     readonly outcomes: readonly ParseTaskOutcome[];
     readonly parsed: ParsedFile[];
     readonly warnings: string[];
@@ -54,10 +60,11 @@ export const resolveParseJobs = (requested: number, taskCount: number): number =
  * （execArgv 传 --import 也不生效），因此开发态用 eval 引导脚本：
  * 先在 worker 内 register()，再动态导入 TS 入口。构建产物走原生 ESM。
  */
-const createWorker = (): Worker => {
+const createWorker = (cache: ParseCacheOptions | undefined): Worker => {
+    const workerData: ParseWorkerData = { cache };
     const tsUrl = new URL("./parse-worker.ts", import.meta.url);
     if (!existsSync(fileURLToPath(tsUrl))) {
-        return new Worker(new URL("./parse-worker.js", import.meta.url));
+        return new Worker(new URL("./parse-worker.js", import.meta.url), { workerData });
     }
 
     const require = createRequire(import.meta.url);
@@ -73,59 +80,38 @@ const createWorker = (): Worker => {
         process.exit(1);
     }
 })();`;
-    return new Worker(code, { eval: true });
+    return new Worker(code, { eval: true, workerData });
 };
 
-interface Batch {
-    readonly id: number;
-    readonly start: number;
-    readonly end: number;
-}
+type Deliver = (index: number, outcome: ParseTaskOutcome) => void;
 
-const makeBatches = (taskCount: number, jobs: number): Batch[] => {
-    const rawSize = Math.ceil(taskCount / (jobs * 8));
-    const size = Math.min(MAX_BATCH_SIZE, Math.max(MIN_BATCH_SIZE, rawSize));
-    const batches: Batch[] = [];
-    for (let start = 0, id = 0; start < taskCount; start += size, id++) {
-        batches.push({ id, start, end: Math.min(start + size, taskCount) });
-    }
-    return batches;
-};
-
+/**
+ * 动态逐文件派发。
+ *
+ * 相比「按文件数切批」，这里由 worker 完成一个就领一个：
+ * 每个 worker 的堆上最多只有正在解析的那一个文件（加上 postMessage 的
+ * 结构化克隆副本），负载也天然均衡，不需要预估单文件耗时或字节数。
+ */
 const runPool = (
     tasks: readonly ParseTask[],
     jobs: number,
     cache: ParseCacheOptions | undefined,
-    onProgress: ParsePoolOptions["onProgress"],
-): Promise<{ outcomes: ParseTaskOutcome[]; cacheHits: number }> => {
-    const outcomes = new Array<ParseTaskOutcome | undefined>(tasks.length);
-    const batches = makeBatches(tasks.length, jobs);
+    deliver: Deliver,
+): Promise<void> => {
     const workers: Worker[] = [];
-    const pending = new Map<Worker, Batch>();
-    let nextBatch = 0;
-    let completed = 0;
-    let cacheHits = 0;
+    /** worker -> 当前在途任务下标 */
+    const busy = new Map<Worker, number>();
+    let nextIndex = 0;
     let settled = false;
 
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
         const terminateAll = (): Promise<unknown> =>
             Promise.allSettled(workers.map((worker) => worker.terminate()));
 
         const finish = (): void => {
             if (settled) return;
-            const filled: ParseTaskOutcome[] = [];
-            for (const entry of outcomes) {
-                if (entry === undefined) {
-                    settled = true;
-                    void terminateAll().then(() =>
-                        reject(new Error("parse worker returned an incomplete batch")),
-                    );
-                    return;
-                }
-                filled.push(entry);
-            }
             settled = true;
-            void terminateAll().then(() => resolve({ outcomes: filled, cacheHits }));
+            void terminateAll().then(() => resolve());
         };
 
         const fail = (error: Error): void => {
@@ -135,65 +121,67 @@ const runPool = (
         };
 
         const dispatch = (worker: Worker): void => {
-            const batch = batches[nextBatch];
-            if (!batch) return;
-            nextBatch++;
-            pending.set(worker, batch);
-            const request: ParseBatchRequest = {
-                type: "parse",
-                batchId: batch.id,
-                tasks: tasks.slice(batch.start, batch.end),
-                cache,
-            };
+            if (settled || nextIndex >= tasks.length) return;
+            const taskId = nextIndex;
+            nextIndex++;
+            busy.set(worker, taskId);
+            const request: ParseTaskRequest = { type: "task", taskId, task: tasks[taskId] };
             worker.postMessage(request);
         };
 
-        for (let index = 0; index < jobs; index++) {
-            const worker = createWorker();
-            workers.push(worker);
+        try {
+            for (let index = 0; index < jobs; index++) {
+                const worker = createWorker(cache);
+                workers.push(worker);
 
-            worker.on("message", (message: unknown) => {
-                if (settled || !isParseWorkerResponse(message)) return;
-                const batch = pending.get(worker);
-                if (!batch || batch.id !== message.batchId) return;
-                pending.delete(worker);
+                worker.on("message", (message: unknown) => {
+                    if (settled || !isParseWorkerResponse(message)) return;
+                    const taskId = busy.get(worker);
+                    if (taskId === undefined || message.taskId !== taskId) return;
+                    busy.delete(worker);
 
-                if (message.type === "error") {
-                    fail(new Error(`parse worker failed: ${message.message}`));
-                    return;
-                }
-                if (message.outcomes.length !== batch.end - batch.start) {
-                    fail(new Error("parse worker returned a mismatched batch"));
-                    return;
-                }
-                for (let offset = 0; offset < message.outcomes.length; offset++) {
-                    const outcome = message.outcomes[offset];
-                    if (outcome === undefined) continue;
-                    if (outcome.cacheHit) cacheHits++;
-                    outcomes[batch.start + offset] = outcome;
-                }
-                completed += message.outcomes.length;
-                onProgress?.(completed, tasks.length);
-                if (completed >= tasks.length) {
-                    finish();
-                    return;
-                }
+                    if (message.type === "error") {
+                        fail(new Error(`parse worker failed: ${message.message}`));
+                        return;
+                    }
+                    deliver(taskId, message.outcome);
+                    dispatch(worker);
+                    if (nextIndex >= tasks.length && busy.size === 0) finish();
+                });
+                worker.on("error", (error: Error) => fail(error));
+                worker.on("exit", (code) => {
+                    if (settled) return;
+                    fail(new Error(`parse worker exited unexpectedly with code ${code}`));
+                });
+
                 dispatch(worker);
-            });
-            worker.on("error", (error: Error) => fail(error));
-            worker.on("exit", (code) => {
-                if (settled) return;
-                fail(new Error(`parse worker exited unexpectedly with code ${code}`));
-            });
-
-            dispatch(worker);
+            }
+        } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+            return;
         }
+
+        if (tasks.length === 0) finish();
     });
+};
+
+/** 单线程路径同样逐文件交付，保证「峰值只与一个文件有关」的对齐。 */
+const runInline = (
+    tasks: readonly ParseTask[],
+    cache: ReturnType<typeof createParseCache> | undefined,
+    deliver: Deliver,
+    delivered: Uint8Array | undefined,
+): void => {
+    for (let index = 0; index < tasks.length; index++) {
+        if (delivered?.[index] === 1) continue;
+        deliver(index, parseTask(tasks[index], cache));
+    }
 };
 
 /**
  * 并行解析入口。所有结果都与 tasks 下标一一对应，因此输出顺序
- * 与单线程完全一致；worker 不可用时自动回退到同步解析。
+ * 与单线程完全一致；worker 不可用时只补跑未交付的文件，避免重复计入
+ * 模块文件数或工作库。
  */
 export const parseFilesInPool = async (
     tasks: readonly ParseTask[],
@@ -214,45 +202,45 @@ export const parseFilesInPool = async (
     const cache = cacheOptions ? createParseCache(cacheOptions) : undefined;
     const jobs = resolveParseJobs(options.jobs ?? 0, tasks.length);
 
-    if (jobs <= 1) {
-        const outcomes = parseTasksInline(tasks, cache);
-        return toResult(outcomes, jobs);
-    }
-
-    try {
-        const { outcomes, cacheHits } = await runPool(
-            tasks,
-            jobs,
-            cacheOptions,
-            options.onProgress,
-        );
-        const result = toResult(outcomes, jobs);
-        return { ...result, cacheHits };
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const outcomes = parseTasksInline(tasks, cache);
-        const result = toResult(outcomes, 1);
-        return {
-            outcomes: result.outcomes,
-            parsed: result.parsed,
-            warnings: [
-                `Parallel parsing unavailable, fell back to single thread: ${message}`,
-                ...result.warnings,
-            ],
-            cacheHits: result.cacheHits,
-            jobs: 1,
-        };
-    }
-};
-
-const toResult = (outcomes: readonly ParseTaskOutcome[], jobs: number): ParsePoolResult => {
-    const parsed: ParsedFile[] = [];
+    const collected: Array<ParseTaskOutcome | undefined> | undefined = options.onFile
+        ? undefined
+        : new Array<ParseTaskOutcome | undefined>(tasks.length);
+    const delivered = new Uint8Array(tasks.length);
     const warnings: string[] = [];
     let cacheHits = 0;
-    for (const outcome of outcomes) {
-        parsed.push(outcome.parsed);
-        if (outcome.warning) warnings.push(outcome.warning);
+    let completed = 0;
+
+    const deliver: Deliver = (index, outcome) => {
+        if (delivered[index] === 1) return;
+        delivered[index] = 1;
         if (outcome.cacheHit) cacheHits++;
+        completed++;
+        options.onFile?.(index, outcome);
+        if (collected) collected[index] = outcome;
+        options.onProgress?.(completed, tasks.length);
+    };
+
+    let actualJobs = jobs;
+    if (jobs <= 1) {
+        runInline(tasks, cache, deliver, delivered);
+    } else {
+        try {
+            await runPool(tasks, jobs, cacheOptions, deliver);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            warnings.push(`Parallel parsing unavailable, fell back to single thread: ${message}`);
+            runInline(tasks, cache, deliver, delivered);
+            actualJobs = 1;
+        }
     }
-    return { outcomes, parsed, warnings, cacheHits, jobs };
+
+    const outcomes: ParseTaskOutcome[] = [];
+    const parsed: ParsedFile[] = [];
+    for (const outcome of collected ?? []) {
+        if (!outcome) continue;
+        outcomes.push(outcome);
+        parsed.push(outcome.parsed);
+    }
+
+    return { outcomes, parsed, warnings, cacheHits, jobs: actualJobs };
 };

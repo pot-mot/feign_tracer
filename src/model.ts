@@ -68,8 +68,14 @@ export interface MethodInfo {
     endLine: number;
     bodyStart?: number;
     bodyEnd?: number;
-    calls: CallSite[];
-    locals: LocalVar[];
+    /**
+     * 方法体内的调用点。大项目下这部分数据会先落到工作库再从内存剥离，
+     * 剥离后为 undefined；读取请统一走 `ProjectIndex.callsOf()`，
+     * 它会在内存字段缺失时回落到工作库。
+     */
+    calls?: CallSite[];
+    /** 局部变量，生命周期与 `calls` 相同。 */
+    locals?: LocalVar[];
     isConstructor: boolean;
     isAbstract: boolean;
 }
@@ -349,6 +355,11 @@ export interface AnalyzeOptions {
     cacheDir: string;
     /** 解析使用的 worker 线程数：0 自动，1 表示单线程。 */
     parseWorkers: number;
+    /**
+     * 是否把方法体转存到临时工作库并在内存中剥离。
+     * 关闭时所有调用点常驻内存，仅适合小项目或对照测试。
+     */
+    workDb: boolean;
     maxFiles: number;
     ignore: string[];
 }

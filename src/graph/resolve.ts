@@ -22,16 +22,19 @@ interface MethodEnv {
     owner: TypeInfo;
     file: ParsedFile | undefined;
     variables: Map<string, string>;
-    fields: Map<string, string>;
+    /** 含继承字段的类型视图，由索引按类型记忆化，避免逐方法重算。 */
+    fields: ReadonlyMap<string, string>;
 }
 
 export const resolveCalls = (index: ProjectIndex, method: MethodInfo): ResolvedCall[] => {
     const owner = index.typesByFqn.get(method.ownerFqn);
     if (!owner) return [];
     const file = index.fileByPath.get(owner.filePath);
+    const calls = index.callsOf(method);
+    if (calls.length === 0) return [];
     const env = buildEnvironment(index, method, owner, file);
 
-    return method.calls.map((call) => resolveOne(index, method, env, call));
+    return calls.map((call) => resolveOne(index, method, env, call));
 };
 
 const buildEnvironment = (
@@ -44,31 +47,12 @@ const buildEnvironment = (
     for (const param of method.params) {
         if (param.name) variables.set(param.name, param.type);
     }
-    for (const local of method.locals) {
+    // 局部变量同样可能已被剥离到工作库，统一走索引访问器。
+    for (const local of index.localsOf(method)) {
         if (local.name && local.type) variables.set(local.name, local.type);
     }
 
-    const fields = new Map<string, string>();
-    collectFields(index, owner, fields, new Set());
-    return { owner, file, variables, fields };
-};
-
-const collectFields = (
-    index: ProjectIndex,
-    type: TypeInfo,
-    result: Map<string, string>,
-    visited: Set<string>,
-): void => {
-    if (visited.has(type.fqn)) return;
-    visited.add(type.fqn);
-    for (const field of type.fields) {
-        if (!result.has(field.name)) result.set(field.name, field.type);
-    }
-    const file = index.fileByPath.get(type.filePath);
-    for (const superName of type.superTypes) {
-        const superType = index.resolveType(superName, file, type);
-        if (superType) collectFields(index, superType, result, visited);
-    }
+    return { owner, file, variables, fields: index.fieldTypesOf(owner) };
 };
 
 const resolveOne = (
@@ -260,10 +244,7 @@ const resolveExpressionType = (
 
     for (const part of parts.slice(1)) {
         if (part === "this") continue;
-        const field =
-            index.methodsOf(currentType).length >= 0
-                ? findField(index, currentType, part)
-                : undefined;
+        const field = findField(index, currentType, part);
         if (field) {
             currentType = index.resolveType(field, env.file, currentType);
             if (!currentType) return undefined;

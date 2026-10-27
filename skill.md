@@ -107,6 +107,16 @@ npx tsx src/cli.ts D:/project --db out/analysis.db \
 
 Cache entries are keyed by absolute path and validated with `mtimeMs`, `size`, and module id.
 
+### 7. Memory behaviour
+
+Parsed method bodies (`calls`/`locals`) are spilled to a throwaway SQLite work
+database and detached from memory as soon as each file is parsed; call trees are
+streamed to a temp file and only read back while writing `call_nodes`. Peak memory
+therefore tracks the largest single file rather than the whole project, as long as
+the output format is `sqlite`. `--format json`, `--format both`, `--stdout` and
+`--print-trees` must keep whole trees in memory. `--no-work-db` disables the work
+database (small projects / parity debugging).
+
 ## Useful options
 
 ```text
@@ -123,6 +133,9 @@ Cache entries are keyed by absolute path and validated with `mtimeMs`, `size`, a
                               exact AND selection (repeatable/comma)
 --no-trees                    index only
 --rebuild-dir <dir>           rebuild only endpoints under dir
+--jobs <n>                    parse workers: 0 = auto, 1 = off
+--no-cache / --cache-dir <d>  parse cache control
+--no-work-db                  keep method bodies in memory (small projects)
 --fresh                       replace DB instead of merging
 --list-endpoints              print endpoints/traces with built status
 --print-trees                 print ordered trees

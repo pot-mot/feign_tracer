@@ -39,8 +39,42 @@ test("parseSourceFile extracts Java structure and calls", () => {
         true,
     );
     assert.equal(
-        type.methods.some((method) => method.calls.length > 0),
+        type.methods.some((method) => (method.calls ?? []).length > 0),
         true,
+    );
+});
+
+test("parseSourceFile falls back to LL when SLL cannot decide", () => {
+    const parsed = parseSourceFile({
+        absPath: join(
+            repoRoot,
+            "examples/shop/order-service/src/main/java/com/example/order/service/OrderServiceImpl.java",
+        ),
+        relPath: "OrderServiceImpl.java",
+        kind: "java",
+    });
+
+    assert.equal(parsed.parseErrors, 0);
+    assert.equal(parsed.types.length, 1);
+    assert.equal(parsed.types[0].methods.length > 0, true);
+});
+
+test("parseSourceFile keeps call sites inside their own method", () => {
+    const source = writeFile(
+        workDir,
+        "src/com/acme/CallRanges.java",
+        "package com.acme;\npublic class CallRanges {\n    public void first() { alpha.run(); }\n    public void second() { beta.run(); }\n    public void third() { gamma.run(); }\n}\n",
+    );
+    const parsed = parseSourceFile({
+        absPath: source,
+        relPath: "src/com/acme/CallRanges.java",
+        kind: "java",
+    });
+
+    const methods = parsed.types[0].methods;
+    assert.deepEqual(
+        methods.map((method) => (method.calls ?? []).map((call) => call.qualifier)),
+        [["alpha"], ["beta"], ["gamma"]],
     );
 });
 

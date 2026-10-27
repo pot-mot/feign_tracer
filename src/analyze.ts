@@ -8,22 +8,22 @@ import type {
     ModuleEdge,
     ModuleInfo,
     ParsedFile,
-    TypeInfo,
 } from "./model.ts";
 import type { DeepReadonly } from "./types.ts";
 import { isSourceKind, scanProject, type ScannedFile } from "./scan.ts";
 import { buildMavenModules, parsePom } from "./build/maven.ts";
 import { buildGradleModules, parseGradleSettings, type GradleSettings } from "./build/gradle.ts";
-import { createProjectIndex, type ProjectIndex } from "./graph/index.ts";
+import { createProjectIndex } from "./graph/index.ts";
 import { buildEndpoints, linkFeignEndpoints } from "./graph/endpoints.ts";
 import { buildCallTrees, buildTraceTrees } from "./graph/calls.ts";
-import { buildFileAnalyses } from "./graph/files.ts";
+import { analyzeFiles } from "./graph/files.ts";
 import { selectEndpoints } from "./graph/select.ts";
 import { buildMethodTraces, filterTracesByKeywords } from "./graph/traces.ts";
-import { resolveCalls, type ResolvedCall } from "./graph/resolve.ts";
 import { createParseCache, type ParseCacheOptions } from "./cache.ts";
-import { parseTasksInline, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
+import { parseTask, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
 import { parseFilesInPool } from "./parse-pool.ts";
+import { createBodyStore, detachBodies, type BodyStore } from "./store/bodies.ts";
+import { createTreeSpool, type TreeSpool } from "./store/tree-spool.ts";
 
 const TOOL_VERSION = "1.0.0";
 
@@ -55,6 +55,7 @@ export const DEFAULT_OPTIONS: Omit<AnalyzeOptions, "root"> = {
     useCache: true,
     cacheDir: ".feign-tracer-cache",
     parseWorkers: 0,
+    workDb: true,
     maxFiles: 50000,
     ignore: [],
 };
@@ -62,6 +63,12 @@ export const DEFAULT_OPTIONS: Omit<AnalyzeOptions, "root"> = {
 export interface AnalyzeAsyncOptions {
     /** 解析进度回调；worker 回退到单线程时不会触发。 */
     readonly onProgress?: (completed: number, total: number) => void;
+    /**
+     * 调用树暂存文件路径。提供后每棵调用树展开完成即写入该文件并从内存释放，
+     * 常驻内存只与「当前正在展开的根」有关；调用方需要在写库时把它交给
+     * `writeAnalysisToSqlite` 的 `treeSpool` 选项。
+     */
+    readonly treeSpoolPath?: string;
 }
 
 interface GradleBuildFile {
@@ -90,13 +97,39 @@ interface PreparedAnalysis {
     readonly cacheOptions: ParseCacheOptions | undefined;
 }
 
+/** 每落库这么多方法体提交一次事务，避免回滚日志和页缓存无限增长。 */
+const BODY_FLUSH_METHODS = 2000;
+
+/**
+ * 解析阶段的累加器。
+ *
+ * 结果按任务下标存放而不是追加，因此 worker 的完成顺序不影响最终输出；
+ * 每个文件在这里完成「剥离方法体 → 计入统计」，之后除了轻量符号信息
+ * 之外不会再有别的对象被保留。
+ */
+interface ParseAccumulator {
+    readonly fileSlots: Array<ParsedFile | undefined>;
+    readonly warningSlots: Array<string | undefined>;
+    calls: number;
+    pendingWrites: number;
+}
+
 export const analyzeDirectory = (
     input: Partial<AnalyzeOptions> & { root: string },
 ): DeepReadonly<AnalysisResult> => {
     const prepared = prepareAnalysis(input);
-    const cache = prepared.cacheOptions ? createParseCache(prepared.cacheOptions) : undefined;
-    const outcomes = parseTasksInline(prepared.tasks, cache);
-    return finalizeAnalysis(prepared, collectParsedFiles(prepared, outcomes));
+    const store = prepared.options.workDb ? createBodyStore() : undefined;
+    try {
+        const accumulator = createAccumulator(prepared);
+        const cache = prepared.cacheOptions ? createParseCache(prepared.cacheOptions) : undefined;
+        for (let index = 0; index < prepared.tasks.length; index++) {
+            const outcome = parseTask(prepared.tasks[index], cache);
+            acceptOutcome(prepared, accumulator, store, index, outcome);
+        }
+        return finalizeAnalysis(prepared, accumulator, store, undefined);
+    } finally {
+        store?.close();
+    }
 };
 
 /**
@@ -108,12 +141,57 @@ export const analyzeDirectoryAsync = async (
     asyncOptions: AnalyzeAsyncOptions = {},
 ): Promise<DeepReadonly<AnalysisResult>> => {
     const prepared = prepareAnalysis(input);
-    const poolResult = await parseFilesInPool(prepared.tasks, {
-        ...(prepared.cacheOptions ?? { root: prepared.root }),
-        jobs: prepared.options.parseWorkers,
-        onProgress: asyncOptions.onProgress,
-    });
-    return finalizeAnalysis(prepared, collectParsedFiles(prepared, poolResult.outcomes));
+    const store = prepared.options.workDb ? createBodyStore() : undefined;
+    try {
+        const accumulator = createAccumulator(prepared);
+        const poolResult = await parseFilesInPool(prepared.tasks, {
+            ...(prepared.cacheOptions ?? { root: prepared.root }),
+            jobs: prepared.options.parseWorkers,
+            onProgress: asyncOptions.onProgress,
+            onFile: (index, outcome) => acceptOutcome(prepared, accumulator, store, index, outcome),
+        });
+        prepared.warnings.push(...poolResult.warnings);
+        return finalizeAnalysis(prepared, accumulator, store, asyncOptions.treeSpoolPath);
+    } finally {
+        store?.close();
+    }
+};
+
+const createAccumulator = (prepared: PreparedAnalysis): ParseAccumulator => {
+    const fileSlots = new Array<ParsedFile | undefined>(prepared.tasks.length);
+    const warningSlots = new Array<string | undefined>(prepared.tasks.length);
+    return { fileSlots, warningSlots, calls: 0, pendingWrites: 0 };
+};
+
+/**
+ * 接收单个文件的解析结果：统计、剥离方法体、按需提交工作库。
+ * 同一个下标重复交付会被忽略，避免模块文件数或统计口径被重复累加。
+ */
+const acceptOutcome = (
+    prepared: PreparedAnalysis,
+    accumulator: ParseAccumulator,
+    store: BodyStore | undefined,
+    index: number,
+    outcome: ParseTaskOutcome,
+): void => {
+    if (accumulator.fileSlots[index] !== undefined) return;
+    accumulator.fileSlots[index] = outcome.parsed;
+    if (outcome.warning) accumulator.warningSlots[index] = outcome.warning;
+
+    // 方法体转存到工作库，并立刻从内存结构中移除。
+    const distilled = detachBodies(store, outcome.parsed);
+    accumulator.calls += distilled.calls;
+    accumulator.pendingWrites += distilled.methods;
+    if (store && accumulator.pendingWrites >= BODY_FLUSH_METHODS) {
+        store.flush();
+        accumulator.pendingWrites = 0;
+    }
+
+    // 模块文件数只在没有解析警告时累加，与原先的合并顺序保持一致。
+    if (!outcome.warning) {
+        const module = prepared.taskModules[index];
+        if (module) module.fileCount++;
+    }
 };
 
 const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): PreparedAnalysis => {
@@ -267,30 +345,31 @@ const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): Pre
 };
 
 /**
- * 按任务顺序合并解析结果。模块 fileCount 与警告顺序都在这里统一处理，
- * 因此 worker 数量不会影响最终输出。
+ * 按任务顺序收集解析结果，并统一输出警告。
+ * 模块文件数在 `acceptOutcome` 中已累加，这里只负责排序与错误检查。
  */
 const collectParsedFiles = (
     prepared: PreparedAnalysis,
-    outcomes: readonly ParseTaskOutcome[],
+    accumulator: ParseAccumulator,
 ): ParsedFile[] => {
     const parsedFiles: ParsedFile[] = [];
-    for (let index = 0; index < outcomes.length; index++) {
-        const outcome = outcomes[index];
-        const module = prepared.taskModules[index];
-        if (outcome.warning) {
-            prepared.warnings.push(outcome.warning);
-        } else if (module) {
-            module.fileCount++;
+    for (let index = 0; index < accumulator.fileSlots.length; index++) {
+        const file = accumulator.fileSlots[index];
+        if (!file) {
+            throw new Error(`Parsing did not finish for ${prepared.tasks[index].relPath}`);
         }
-        parsedFiles.push(outcome.parsed);
+        const warning = accumulator.warningSlots[index];
+        if (warning) prepared.warnings.push(warning);
+        parsedFiles.push(file);
     }
     return parsedFiles;
 };
 
 const finalizeAnalysis = (
     prepared: PreparedAnalysis,
-    parsedFiles: ParsedFile[],
+    accumulator: ParseAccumulator,
+    store: BodyStore | undefined,
+    treeSpoolPath: string | undefined,
 ): DeepReadonly<AnalysisResult> => {
     const {
         started,
@@ -305,7 +384,9 @@ const finalizeAnalysis = (
         classFilterRegexes,
     } = prepared;
 
-    const index = createProjectIndex(parsedFiles, modules);
+    // 方法体已经剥离到工作库，索引里只保留类型/方法签名这类轻量符号。
+    const parsedFiles = collectParsedFiles(prepared, accumulator);
+    const index = createProjectIndex(parsedFiles, modules, store);
     const endpointResult = buildEndpoints(index);
     linkFeignEndpoints(index, endpointResult.endpoints, endpointResult.feignOperations);
 
@@ -327,61 +408,79 @@ const finalizeAnalysis = (
     };
 
     let traces: MethodTrace[] = [];
+    /*
+     * 只有需要 SQLite 输出时才把调用树外写到暂存文件：JSON 输出必须内联整棵树，
+     * 因此那条路径仍然保留在内存里（并在 CLI 侧给出对应提示）。
+     */
+    const treeSpool: TreeSpool | undefined =
+        treeSpoolPath && options.buildTrees ? createTreeSpool(treeSpoolPath) : undefined;
 
-    if (options.buildTrees) {
-        buildCallTrees(
-            index,
-            selectedEndpoints,
-            endpointResult.feignOperations,
-            treeOptions,
-            endpointResult.endpoints,
-        );
-
-        if (options.classNames.length > 0 || options.methodNames.length > 0) {
-            const traceResult = buildMethodTraces(
+    try {
+        if (options.buildTrees) {
+            buildCallTrees(
                 index,
-                { classNames: options.classNames, methodNames: options.methodNames },
-                endpointResult.endpoints,
-            );
-            traces = filterTracesByKeywords(traceResult.traces, options.keywords);
-            warnings.push(...traceResult.warnings);
-            buildTraceTrees(
-                index,
-                traces,
-                endpointResult.endpoints,
+                selectedEndpoints,
                 endpointResult.feignOperations,
                 treeOptions,
                 endpointResult.endpoints,
+                treeSpool?.sink,
             );
-        }
 
-        if (
-            selectedEndpoints.length === 0 &&
-            (options.keywords.length > 0 ||
-                options.classNames.length > 0 ||
-                options.methodNames.length > 0 ||
-                options.rebuildDir)
-        ) {
-            const criteria = [
-                options.keywords.length > 0 ? `keyword(s) ${options.keywords.join(", ")}` : "",
-                options.classNames.length > 0 ? `class(es) ${options.classNames.join(", ")}` : "",
-                options.methodNames.length > 0 ? `method(s) ${options.methodNames.join(", ")}` : "",
-                options.rebuildDir ? `--rebuild-dir ${options.rebuildDir}` : "",
-            ]
-                .filter(Boolean)
-                .join(", ");
-            warnings.push(
-                traces.length > 0
-                    ? `No controller endpoint matched ${criteria}; ${traces.length} method trace(s) were built instead.`
-                    : `No controller endpoint matched ${criteria}; no endpoint call trees were built.`,
-            );
+            if (options.classNames.length > 0 || options.methodNames.length > 0) {
+                const traceResult = buildMethodTraces(
+                    index,
+                    { classNames: options.classNames, methodNames: options.methodNames },
+                    endpointResult.endpoints,
+                );
+                traces = filterTracesByKeywords(traceResult.traces, options.keywords);
+                warnings.push(...traceResult.warnings);
+                buildTraceTrees(
+                    index,
+                    traces,
+                    endpointResult.endpoints,
+                    endpointResult.feignOperations,
+                    treeOptions,
+                    endpointResult.endpoints,
+                    treeSpool?.sink,
+                );
+            }
+
+            if (
+                selectedEndpoints.length === 0 &&
+                (options.keywords.length > 0 ||
+                    options.classNames.length > 0 ||
+                    options.methodNames.length > 0 ||
+                    options.rebuildDir)
+            ) {
+                const criteria = [
+                    options.keywords.length > 0 ? `keyword(s) ${options.keywords.join(", ")}` : "",
+                    options.classNames.length > 0
+                        ? `class(es) ${options.classNames.join(", ")}`
+                        : "",
+                    options.methodNames.length > 0
+                        ? `method(s) ${options.methodNames.join(", ")}`
+                        : "",
+                    options.rebuildDir ? `--rebuild-dir ${options.rebuildDir}` : "",
+                ]
+                    .filter(Boolean)
+                    .join(", ");
+                warnings.push(
+                    traces.length > 0
+                        ? `No controller endpoint matched ${criteria}; ${traces.length} method trace(s) were built instead.`
+                        : `No controller endpoint matched ${criteria}; no endpoint call trees were built.`,
+                );
+            }
+        } else {
+            warnings.push("Call tree building disabled (--no-trees); endpoints were indexed only.");
         }
-    } else {
-        warnings.push("Call tree building disabled (--no-trees); endpoints were indexed only.");
+    } finally {
+        // 暂存文件在写入数据库之前必须完整落盘。
+        treeSpool?.close();
     }
 
-    const resolveCache = new Map<string, ResolvedCall[]>();
-    const files = options.includeSource ? buildFileAnalyses(index, resolveCache) : [];
+    // 依赖边与 resolved 计数在同一次遍历里完成，避免重复解析所有方法。
+    const fileResult = analyzeFiles(index, options.includeSource);
+    const files = fileResult.files;
     const moduleEdges = buildModuleEdges(modules);
 
     const stats: AnalysisStats = {
@@ -394,11 +493,8 @@ const finalizeAnalysis = (
         modules: modules.length,
         types: index.typesByFqn.size,
         methods: [...index.typesByFqn.values()].reduce((sum, type) => sum + type.methods.length, 0),
-        calls: parsedFiles.reduce(
-            (sum, file) => sum + file.types.reduce((inner, type) => inner + countCalls(type), 0),
-            0,
-        ),
-        resolvedCalls: countResolvedCalls(index),
+        calls: accumulator.calls,
+        resolvedCalls: fileResult.resolvedCalls,
         endpoints: endpointResult.endpoints.length,
         endpointsBuilt: endpointResult.endpoints.filter((endpoint) => endpoint.treeBuilt).length,
         traces: traces.length,
@@ -487,21 +583,4 @@ const buildModuleEdges = (modules: ModuleInfo[]): ModuleEdge[] => {
         }
     }
     return [...edges.values()];
-};
-
-const countCalls = (type: TypeInfo): number => {
-    let total = 0;
-    for (const method of type.methods) total += method.calls.length;
-    for (const nested of type.nested) total += countCalls(nested);
-    return total;
-};
-
-const countResolvedCalls = (index: ProjectIndex): number => {
-    let total = 0;
-    for (const method of index.methodById.values()) {
-        for (const resolved of resolveCalls(index, method)) {
-            if (resolved.target) total++;
-        }
-    }
-    return total;
 };
