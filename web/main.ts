@@ -6,6 +6,8 @@ import type {
     MethodTrace,
 } from "../src/model.ts";
 import { formatNodeLabel, type DisplayMode } from "../src/graph/display.ts";
+import { mountDatabasePage } from "./database.ts";
+import { SearchSelectElement } from "./search-select.ts";
 import "./style.css";
 
 const TABS = ["endpoints", "traces", "modules", "files", "json"] as const;
@@ -15,7 +17,12 @@ type AnalyzeOverrides = {
     keywords?: string[];
     classNames?: string[];
     methodNames?: string[];
+    /** 保留已有结果并在其上合并本次增量（构建单个调用树时使用）。 */
     preserve?: boolean;
+    /** 忽略服务端索引与解析缓存，重新扫描项目。 */
+    forceRescan?: boolean;
+    /** 只重建该目录下的文件与端点。 */
+    rebuildDir?: string;
 };
 
 /** DOM 节点缺失说明页面结构被破坏，直接抛错比静默失败更易定位。 */
@@ -27,6 +34,24 @@ const requireElement = <T extends Element>(selector: string): T => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === "object" && value !== null;
+
+const isString = (value: unknown): value is string => typeof value === "string";
+
+interface SavedProjectEntry {
+    readonly baseDir: string;
+    readonly updatedAt: string;
+}
+
+const isSavedProjectEntry = (value: unknown): value is SavedProjectEntry =>
+    isRecord(value) && typeof value.baseDir === "string" && typeof value.updatedAt === "string";
+
+const isSavedProjectsResponse = (
+    value: unknown,
+): value is { readonly projects: SavedProjectEntry[] } =>
+    isRecord(value) && Array.isArray(value.projects) && value.projects.every(isSavedProjectEntry);
+
+const isProjectOptionsResponse = (value: unknown): value is { readonly options: string[] } =>
+    isRecord(value) && Array.isArray(value.options) && value.options.every(isString);
 
 const isAnalyzeResponse = (value: unknown): value is AnalyzeResponse => {
     if (!isRecord(value)) return false;
@@ -67,6 +92,8 @@ type Selection = {
     readonly methodNames: readonly string[];
 };
 let lastSelection: Selection = { keywords: [], classNames: [], methodNames: [] };
+/** 分析期间数据库可能被写入；暂停候选查询，保留已有下拉选项。 */
+let analysisInProgress = false;
 
 app.innerHTML = `
   <header class="hero">
@@ -80,10 +107,16 @@ app.innerHTML = `
     <div class="status" id="status">就绪</div>
   </header>
 
+  <nav class="top-nav">
+    <a class="nav-link active" id="navAnalyze" href="#/analyze">分析</a>
+    <a class="nav-link" id="navDatabase" href="#/database">数据库</a>
+  </nav>
+
+  <div id="analyzePage">
   <section class="panel search-panel">
     <label class="root-field">
       <span>项目根目录</span>
-      <input id="root" spellcheck="false" placeholder="D:\\path\\to\\project" />
+      <ft-select id="projectSelect" class="project-select" placeholder="选择或输入项目根目录"></ft-select>
     </label>
     <div class="options">
       <label><input id="followFeign" type="checkbox" checked /> 跨服务追踪 Feign</label>
@@ -97,16 +130,16 @@ app.innerHTML = `
     </label>
     <div class="selection-row">
       <label>
-        <span>端点关键词（可选）</span>
-        <input id="keywords" type="text" spellcheck="false" placeholder="order, /api/users" />
+        <span>端点关键词（可选，支持模糊）</span>
+        <ft-select id="keywords" class="filter-select" placeholder="选择或输入端点关键词"></ft-select>
       </label>
       <label>
-        <span>精确类名（可选）</span>
-        <input id="className" type="text" spellcheck="false" placeholder="OrderController 或 com.acme.OrderService" />
+        <span>类名（可选，支持模糊）</span>
+        <ft-select id="className" class="filter-select" placeholder="选择或输入类名"></ft-select>
       </label>
       <label>
-        <span>精确函数名（可选）</span>
-        <input id="methodName" type="text" spellcheck="false" placeholder="list" />
+        <span>函数名（可选，支持模糊）</span>
+        <ft-select id="methodName" class="filter-select" placeholder="选择或输入函数名"></ft-select>
       </label>
     </div>
     <div class="display-options">
@@ -119,65 +152,245 @@ app.innerHTML = `
       <span>SQLite 保存路径（留空不保存）</span>
       <input id="dbPath" type="text" spellcheck="false" value="feign-trace.db" title="相对服务端工作目录；留空则只在内存中分析" />
     </label>
-    <button id="analyze" class="primary">开始分析</button>
+    <label class="db-field">
+      <span>重扫描目录（可选，留空=整个项目）</span>
+      <input id="rescanDir" type="text" spellcheck="false" placeholder="src/main/java/com/acme/order" title="强制重扫描时只重新解析该目录；普通分析会复用已有索引" />
+    </label>
+    <div class="action-row">
+      <button id="analyze" class="primary">开始分析</button>
+      <button id="rescan" class="secondary" title="忽略解析缓存并重新扫描；填写重扫描目录时只重建该目录">强制重扫描</button>
+    </div>
   </section>
 
   <main id="content"></main>
+  </div>
+
+  <section id="databasePage" hidden></section>
 `;
 
-const rootInput = requireElement<HTMLInputElement>("#root");
+const projectSelect = requireElement<SearchSelectElement>("#projectSelect");
 const followFeign = requireElement<HTMLInputElement>("#followFeign");
 const includeExternal = requireElement<HTMLInputElement>("#includeExternal");
 const excludeSelfCalls = requireElement<HTMLInputElement>("#excludeSelfCalls");
 const classFiltersInput = requireElement<HTMLInputElement>("#classFilters");
-const keywordsInput = requireElement<HTMLInputElement>("#keywords");
-const classNameInput = requireElement<HTMLInputElement>("#className");
-const methodNameInput = requireElement<HTMLInputElement>("#methodName");
+const keywordsSelect = requireElement<SearchSelectElement>("#keywords");
+const classNameSelect = requireElement<SearchSelectElement>("#className");
+const methodNameSelect = requireElement<SearchSelectElement>("#methodName");
 const showParams = requireElement<HTMLInputElement>("#showParams");
 const showParamTypes = requireElement<HTMLInputElement>("#showParamTypes");
 const showVisibility = requireElement<HTMLInputElement>("#showVisibility");
 const dbPathInput = requireElement<HTMLInputElement>("#dbPath");
+const rescanDirInput = requireElement<HTMLInputElement>("#rescanDir");
 const maxDepth = requireElement<HTMLInputElement>("#maxDepth");
 const analyzeButton = requireElement<HTMLButtonElement>("#analyze");
+const rescanButton = requireElement<HTMLButtonElement>("#rescan");
 const statusEl = requireElement<HTMLDivElement>("#status");
 const content = requireElement<HTMLElement>("#content");
+const analyzePage = requireElement<HTMLElement>("#analyzePage");
+const databasePage = requireElement<HTMLElement>("#databasePage");
+const navAnalyze = requireElement<HTMLAnchorElement>("#navAnalyze");
+const navDatabase = requireElement<HTMLAnchorElement>("#navDatabase");
+
+const DATABASE_ROUTE = "#/database";
+const ANALYZE_ROUTE = "#/analyze";
+let databaseMounted = false;
+
+const applyRoute = (): void => {
+    const database = location.hash.startsWith(DATABASE_ROUTE);
+    analyzePage.hidden = database;
+    databasePage.hidden = !database;
+    navAnalyze.classList.toggle("active", !database);
+    navDatabase.classList.toggle("active", database);
+    if (database && !databaseMounted) {
+        databaseMounted = true;
+        mountDatabasePage(databasePage, dbPathInput.value.trim() || "feign-trace.db");
+    }
+};
+
+window.addEventListener("hashchange", applyRoute);
+if (!location.hash) location.replace(ANALYZE_ROUTE);
+applyRoute();
+
+let projectRequest = 0;
+let projectSearchTimer: number | undefined;
+
+const renderProjectOptions = (projects: readonly SavedProjectEntry[]): void => {
+    projectSelect.placeholder =
+        projects.length > 0 ? `选择已有项目（${projects.length}）` : "没有已保存项目";
+    projectSelect.setOptions(projects.map((project) => project.baseDir));
+};
+
+const loadSavedProjects = async (query: string): Promise<void> => {
+    if (analysisInProgress) return;
+    const request = ++projectRequest;
+    const dbPath = dbPathInput.value.trim();
+    if (!dbPath) {
+        renderProjectOptions([]);
+        return;
+    }
+    try {
+        const response = await fetch(
+            `/api/projects?path=${encodeURIComponent(dbPath)}&q=${encodeURIComponent(query)}`,
+        );
+        if (request !== projectRequest) return;
+        if (!response.ok) return;
+        const raw: unknown = await response.json();
+        if (request !== projectRequest) return;
+        if (!isSavedProjectsResponse(raw)) return;
+        renderProjectOptions(raw.projects);
+    } catch {
+        // 数据库可能正在分析写入；保留上一次可用列表，避免下拉瞬间清空。
+    }
+};
+
+const scheduleProjectSearch = (query: string): void => {
+    if (projectSearchTimer !== undefined) window.clearTimeout(projectSearchTimer);
+    projectSearchTimer = window.setTimeout(() => void loadSavedProjects(query), 120);
+};
+
+type FilterOptionKind = "endpoint" | "class" | "method";
+
+interface FilterControl {
+    readonly kind: FilterOptionKind;
+    readonly select: SearchSelectElement;
+}
+
+const filterControls: readonly FilterControl[] = [
+    { kind: "endpoint", select: keywordsSelect },
+    { kind: "class", select: classNameSelect },
+    { kind: "method", select: methodNameSelect },
+];
+const filterOptionRequests = new Map<FilterOptionKind, number>();
+const filterOptionTimers = new Map<FilterOptionKind, number>();
+
+const filterOptionLabel = (kind: FilterOptionKind): string =>
+    kind === "endpoint" ? "端点" : kind === "class" ? "类" : "函数";
+
+const renderFilterOptions = (control: FilterControl, options: readonly string[]): void => {
+    const label = filterOptionLabel(control.kind);
+    control.select.placeholder =
+        options.length > 0 ? `选择${label}（${options.length}）` : `暂无${label}候选`;
+    control.select.setOptions(options);
+};
+
+const loadFilterOptions = async (control: FilterControl, queryOverride?: string): Promise<void> => {
+    if (analysisInProgress) return;
+    const request = (filterOptionRequests.get(control.kind) ?? 0) + 1;
+    filterOptionRequests.set(control.kind, request);
+    const root = projectSelect.value.trim();
+    const dbPath = dbPathInput.value.trim();
+    if (!root || !dbPath) {
+        renderFilterOptions(control, []);
+        return;
+    }
+    const query = queryOverride ?? control.select.value.trim();
+    try {
+        const response = await fetch(
+            `/api/project-options?path=${encodeURIComponent(dbPath)}&root=${encodeURIComponent(
+                root,
+            )}&kind=${control.kind}&q=${encodeURIComponent(query)}`,
+        );
+        if (filterOptionRequests.get(control.kind) !== request) return;
+        if (!response.ok) return;
+        const raw: unknown = await response.json();
+        if (filterOptionRequests.get(control.kind) !== request) return;
+        if (!isProjectOptionsResponse(raw)) return;
+        renderFilterOptions(control, raw.options);
+    } catch {
+        // 分析写入期间数据库可能短暂不可读；保留已有候选，避免下拉被清空。
+    }
+};
+
+const scheduleFilterOptions = (
+    control: FilterControl,
+    delay = 120,
+    queryOverride?: string,
+): void => {
+    const existing = filterOptionTimers.get(control.kind);
+    if (existing !== undefined) window.clearTimeout(existing);
+    filterOptionTimers.set(
+        control.kind,
+        window.setTimeout(() => void loadFilterOptions(control, queryOverride), delay),
+    );
+};
+
+const refreshFilterOptions = (delay = 0, loadAll = false): void => {
+    for (const control of filterControls) {
+        scheduleFilterOptions(control, delay, loadAll ? "" : undefined);
+    }
+};
+
+for (const control of filterControls) {
+    control.select.addEventListener("input", () => scheduleFilterOptions(control));
+    control.select.addEventListener("open", () => void loadFilterOptions(control, ""));
+    control.select.addEventListener("change", () => void loadFilterOptions(control, ""));
+}
+
+projectSelect.addEventListener("input", () => scheduleProjectSearch(projectSelect.value));
+projectSelect.addEventListener("open", () => void loadSavedProjects(""));
+projectSelect.addEventListener("change", () => refreshFilterOptions(0, true));
+dbPathInput.addEventListener("change", () => {
+    void loadSavedProjects("");
+    refreshFilterOptions(0, true);
+});
 
 fetch("/api/analyze")
     .then(async (response) => {
         const payload: unknown = await response.json();
         if (isRecord(payload) && typeof payload.root === "string") {
-            rootInput.value = payload.root;
+            projectSelect.value = payload.root;
         }
     })
     .catch(() => {
-        rootInput.value = "D:\\project\\feign_tracer\\examples\\shop";
+        projectSelect.value = "D:\\project\\feign_tracer\\examples\\shop";
+    })
+    .finally(() => {
+        // 根目录就绪后再同步一次已有项目/筛选候选，保证首次打开即可选择。
+        void loadSavedProjects("");
+        refreshFilterOptions(250, true);
     });
 
 for (const toggle of [showParams, showParamTypes, showVisibility]) {
     toggle.addEventListener("change", () => render());
 }
 analyzeButton.addEventListener("click", () => void analyze());
-rootInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") void analyze();
-});
+rescanButton.addEventListener("click", () => void analyze({ forceRescan: true }));
 
 const analyze = async (overrides: AnalyzeOverrides = {}): Promise<void> => {
-    const root = rootInput.value.trim();
+    const root = projectSelect.value.trim();
     if (!root) {
         setStatus("请输入目录", true);
         return;
     }
-    const keywords = overrides.keywords ?? splitFilters(keywordsInput.value);
-    const classNames = overrides.classNames ?? splitFilters(classNameInput.value);
-    const methodNames = overrides.methodNames ?? splitFilters(methodNameInput.value);
-    const incremental = keywords.length > 0 || classNames.length > 0 || methodNames.length > 0;
+    analysisInProgress = true;
+    const keywords = overrides.keywords ?? splitFilters(keywordsSelect.value);
+    const classNames = overrides.classNames ?? splitFilters(classNameSelect.value);
+    const methodNames = overrides.methodNames ?? splitFilters(methodNameSelect.value);
+    // 强制重扫描可以只针对一个目录；留空时才重建整个项目。
+    const rebuildDir =
+        overrides.rebuildDir ?? (overrides.forceRescan === true ? rescanDirInput.value.trim() : "");
+    const forceRescan = overrides.forceRescan === true && !rebuildDir;
+    const hasSelection = keywords.length > 0 || classNames.length > 0 || methodNames.length > 0;
+    const incremental = hasSelection || Boolean(rebuildDir) || overrides.preserve === true;
 
+    const busyText = forceRescan
+        ? "强制重扫描中…"
+        : rebuildDir
+          ? "重扫描指定目录…"
+          : incremental
+            ? "构建匹配调用链…"
+            : "解析中…";
     analyzeButton.disabled = true;
-    setStatus(incremental ? "构建匹配调用链…" : "解析中…");
+    rescanButton.disabled = true;
+    setStatus(busyText);
     content.innerHTML = `<div class="loading"><div class="spinner"></div><span>${
-        incremental
-            ? "正在定位精确类名/函数名并构建调用链…"
-            : "正在扫描目录、解析 ANTLR 语法树并构建调用链…"
+        forceRescan
+            ? "正在忽略缓存并重新扫描整个项目…"
+            : rebuildDir
+              ? `正在重新扫描目录 ${escapeHtml(rebuildDir)} 并复用其余解析结果…`
+              : incremental
+                ? "正在复用项目索引并构建匹配的调用链…"
+                : "正在扫描目录、解析 ANTLR 语法树并构建调用链…"
     }</span></div>`;
 
     try {
@@ -194,7 +407,10 @@ const analyze = async (overrides: AnalyzeOverrides = {}): Promise<void> => {
                 classNames,
                 methodNames,
                 buildTrees: true,
-                fresh: !incremental,
+                rebuildDir: rebuildDir || undefined,
+                forceRescan,
+                // Web 端不整库替换：已有数据库走合并写入，避免复制/重建大库。
+                fresh: false,
                 dbPath: dbPathInput.value.trim() || undefined,
                 maxDepth: Number(maxDepth.value) || 12,
                 includeSource: true,
@@ -241,7 +457,12 @@ const analyze = async (overrides: AnalyzeOverrides = {}): Promise<void> => {
         )}</pre></div>`;
         setStatus("失败", true);
     } finally {
+        analysisInProgress = false;
         analyzeButton.disabled = false;
+        rescanButton.disabled = false;
+        // 分析期间暂停的候选查询在数据库写入完成后补一次；加载完整候选，
+        // 避免被当前输入值过滤后看起来像“选项消失”。
+        refreshFilterOptions(0, true);
     }
 };
 
@@ -319,7 +540,7 @@ const statsSection = (data: AnalysisResult): HTMLElement => {
         [
             "方法调用链",
             String(data.stats.traces),
-            `${data.stats.tracesBuilt} 已构建 · 精确类名/函数`,
+            `${data.stats.tracesBuilt} 已构建 · 类名/函数筛选`,
         ],
         [
             "Feign",
@@ -428,7 +649,7 @@ const endpointsView = (data: AnalysisResult): HTMLElement => {
                     "div",
                     "empty",
                     lastSelection.classNames.length > 0 || lastSelection.methodNames.length > 0
-                        ? "没有符合“关键词 + 精确类名 + 精确函数名（AND）”的 Controller 端点；请查看“方法调用链”页签。"
+                        ? "没有符合“关键词 + 类名 + 函数名（AND，支持模糊）”的 Controller 端点；请查看“方法调用链”页签。"
                         : "没有匹配的端点",
                 ),
             );
@@ -452,7 +673,7 @@ const tracesView = (data: AnalysisResult): HTMLElement => {
     search.value = traceFilter;
     toolbar.appendChild(search);
     toolbar.appendChild(
-        el("div", "toolbar-hint", "精确类名 + 函数名：接口会展开为每个实现类的调用树"),
+        el("div", "toolbar-hint", "类名 + 函数名支持模糊匹配：接口会展开为每个实现类的调用树"),
     );
     const selectionHint = describeSelection(lastSelection);
     if (selectionHint) toolbar.appendChild(el("div", "toolbar-hint", selectionHint));
@@ -478,7 +699,7 @@ const tracesView = (data: AnalysisResult): HTMLElement => {
                 el(
                     "div",
                     "empty",
-                    "没有方法调用链。输入精确类名/函数名后分析，例如 OrderService + list。",
+                    "没有方法调用链。输入类名/函数名（支持模糊）后分析，例如 OrderService + list。",
                 ),
             );
             return;
@@ -596,7 +817,22 @@ const handlerMethodName = (endpoint: EndpointInfo): string | undefined => {
     return match?.[1];
 };
 
-/** 关键词 AND 精确类名 AND 精确函数名，与服务端过滤逻辑一致。 */
+const matchesFilterText = (value: string, filter: string): boolean => {
+    const regex = /^\/(.+)\/([a-z]*)$/i.exec(filter);
+    if (regex) {
+        try {
+            return new RegExp(regex[1], `${regex[2].replace(/[gi]/g, "")}i`).test(value);
+        } catch {
+            return value.toLowerCase().includes(filter.toLowerCase());
+        }
+    }
+    return value.toLowerCase().includes(filter.toLowerCase());
+};
+
+const matchesAnyFilter = (values: readonly string[], filters: readonly string[]): boolean =>
+    filters.some((filter) => values.some((value) => matchesFilterText(value, filter)));
+
+/** 关键词 AND 类名 AND 函数名；关键词全部匹配，类名/函数名多个过滤词之间为 OR。 */
 const matchesEndpointSelection = (endpoint: EndpointInfo, selection: Selection): boolean => {
     if (
         !matchesKeywords(selection.keywords, [
@@ -612,17 +848,13 @@ const matchesEndpointSelection = (endpoint: EndpointInfo, selection: Selection):
     }
     if (selection.classNames.length > 0) {
         const simpleName = endpoint.controller.split(".").pop() ?? endpoint.controller;
-        if (
-            !selection.classNames.some(
-                (name) => name === endpoint.controller || name === simpleName,
-            )
-        ) {
+        if (!matchesAnyFilter([endpoint.controller, simpleName], selection.classNames)) {
             return false;
         }
     }
     if (selection.methodNames.length > 0) {
         const methodName = handlerMethodName(endpoint);
-        if (!methodName || !selection.methodNames.includes(methodName)) return false;
+        if (!methodName || !matchesAnyFilter([methodName], selection.methodNames)) return false;
     }
     return true;
 };
@@ -643,35 +875,24 @@ const matchesTraceSelection = (trace: MethodTrace, selection: Selection): boolea
         const candidates = [trace.className, trace.implementationOf].filter(
             (value): value is string => Boolean(value),
         );
-        if (!candidates.some((value) => matchesClassName(value, selection.classNames))) {
+        const simpleNames = candidates.map((value) => value.split(".").pop() ?? value);
+        if (!matchesAnyFilter([...candidates, ...simpleNames], selection.classNames)) {
             return false;
         }
     }
-    if (selection.methodNames.length > 0 && !selection.methodNames.includes(trace.methodName)) {
+    if (
+        selection.methodNames.length > 0 &&
+        !matchesAnyFilter([trace.methodName], selection.methodNames)
+    ) {
         return false;
     }
     return true;
 };
 
-const matchesClassName = (value: string, names: readonly string[]): boolean => {
-    const simpleName = value.split(".").pop() ?? value;
-    return names.some((name) => name === value || name === simpleName);
-};
-
 const matchesKeywords = (keywords: readonly string[], values: readonly string[]): boolean => {
     if (keywords.length === 0) return true;
-    const haystack = values.join("\n").toLowerCase();
-    return keywords.every((keyword) => {
-        const regex = /^\/(.+)\/([a-z]*)$/i.exec(keyword);
-        if (regex) {
-            try {
-                return new RegExp(regex[1], `${regex[2].replace(/[gi]/g, "")}i`).test(haystack);
-            } catch {
-                return haystack.includes(keyword.toLowerCase());
-            }
-        }
-        return haystack.includes(keyword.toLowerCase());
-    });
+    const haystack = values.join("\n");
+    return keywords.every((keyword) => matchesFilterText(haystack, keyword));
 };
 
 const describeSelection = (selection: Selection): string => {
@@ -679,7 +900,7 @@ const describeSelection = (selection: Selection): string => {
     if (selection.keywords.length > 0) parts.push(`keyword=${selection.keywords.join(",")}`);
     if (selection.classNames.length > 0) parts.push(`class=${selection.classNames.join(",")}`);
     if (selection.methodNames.length > 0) parts.push(`method=${selection.methodNames.join(",")}`);
-    return parts.length > 0 ? `精确筛选（AND）：${parts.join(" · ")}` : "";
+    return parts.length > 0 ? `模糊筛选（AND）：${parts.join(" · ")}` : "";
 };
 
 const renderTreeNode = (

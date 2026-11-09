@@ -35,6 +35,12 @@ const isParseTask = (value: unknown): value is ParseTask => {
     if (!isObject(value)) return false;
     if (typeof value.absPath !== "string" || typeof value.relPath !== "string") return false;
     if (value.kind !== "java" && value.kind !== "kotlin" && value.kind !== "groovy") return false;
+    if (
+        value.bytes !== undefined &&
+        (typeof value.bytes !== "number" || !Number.isFinite(value.bytes))
+    ) {
+        return false;
+    }
     return value.moduleId === undefined || typeof value.moduleId === "string";
 };
 

@@ -63,8 +63,8 @@ The three filters combine with AND:
 | Filter | CLI | Match rule |
 | --- | --- | --- |
 | Endpoint keyword | `--keyword order` (repeatable/comma) | case-insensitive substring or `/regex/flags` over id/path/handler/controller/module; every keyword must match |
-| Exact class | `--class-name OrderController` | exact simple name or FQN (comma separated for multiple) |
-| Exact method | `--method-name list` | exact method name; overloads all match |
+| Class | `--class-name Order` | case-insensitive substring or `/regex/` over simple name/FQN; multiple are OR |
+| Method | `--method-name list` | case-insensitive substring or `/regex/` over method name; overloads all match |
 
 Only matching controller endpoints are expanded. If the class/method does not identify a controller, a method-level trace is created instead (see next section).
 
@@ -173,11 +173,20 @@ Node metadata:
 
 ## SQLite queries
 
-Schema version 3. Key tables/views:
+Schema version 4. Key tables/views:
 
+- `projects` (`base_dir` unique), `project_files` -> `project_classes` -> `project_methods` -> `project_calls`
 - `endpoints` (`tree_built`), `traces` (`tree_built`, `implementation_of`)
 - `call_nodes` (`root_type` = `endpoint|trace`, `sort_key`, `implementation_of`, `cyclic`)
 - `v_endpoint_overview`, `v_trace_overview`, `v_module_overview`, `v_file_overview`
+
+The `project_*` tables persist parsed symbols across runs. A scan first matches
+`projects.base_dir`, then reuses unchanged files by `mtime + size + module`;
+`project_calls` links caller and resolved callee methods.
+
+Existing databases migrate automatically on first analysis, project-list read
+or database-page read: schema upgrade, `projects` backfill from `analysis.root`,
+base-dir normalization and removal of tables/views outside the current schema.
 
 ```sql
 -- Endpoint trees and build status
@@ -214,8 +223,8 @@ JSON output contains `meta`, `stats`, `modules`, `moduleEdges`, `endpoints[].tre
 
 ## Web UI
 
-- Project root + analyze.
-- “端点关键词 / 精确类名 / 精确函数名” inputs: only matching results (AND) are listed; the results view does not show every unrelated chain.
+- Project root + analyze; the custom `ft-select` input is both search box and value field, filtering saved `projects.base_dir` entries or accepting a manual path.
+- “端点关键词 / 类名 / 函数名” are custom searchable `ft-select` inputs (fuzzy substring or `/regex/`, free text allowed); after selecting a project root, each refreshes candidates from the project index.
 - “方法调用链” tab shows interface implementations as separate cards.
 - “参数列表 / 参数类型 / 可见性” toggles re-render labels client-side.
 - Unbuilt cards have “构建调用树” buttons that run a focused incremental analysis.

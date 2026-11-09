@@ -3,6 +3,7 @@ import { methodLabel } from "../languages/common.ts";
 import type { ProjectIndex } from "./index.ts";
 import { paramsOf, visibilityOf } from "./display.ts";
 import { signatureOf } from "./endpoints.ts";
+import { matchesFilterText } from "./select.ts";
 
 export interface TraceSelection {
     /** 精确类简单名或全限定名；空表示任意类。 */
@@ -68,10 +69,11 @@ export const buildMethodTraces = (
 
     const endpointHandlers = new Set(endpoints.map((endpoint) => endpoint.handler));
     const matchedTypes = selectTypes(index, classNames);
+    const seenTraces = new Set<string>();
 
     if (classNames.length > 0 && matchedTypes.length === 0) {
         warnings.push(
-            `No class matched exact name(s) ${classNames.join(", ")}; no method traces were built.`,
+            `No class matched name filter(s) ${classNames.join(", ")}; no method traces were built.`,
         );
         return { traces, warnings };
     }
@@ -80,18 +82,21 @@ export const buildMethodTraces = (
         const methods = type.methods.filter((method) => {
             if (method.isConstructor) return false;
             if (methodNames.length === 0) return true;
-            return methodNames.includes(method.name);
+            return methodNames.some((name) => matchesFilterText(method.name, name));
         });
 
         for (const method of methods) {
             const expanded = expandRootMethod(index, type, method, endpointHandlers);
             for (const trace of expanded) {
+                // 模糊类名可能同时命中接口与其实现，方法链根按 id 去重。
+                if (seenTraces.has(trace.id)) continue;
                 if (traces.length >= MAX_TRACES) {
                     warnings.push(
                         `Method trace selection was truncated at ${MAX_TRACES} roots; narrow --class-name/--method-name.`,
                     );
                     break outer;
                 }
+                seenTraces.add(trace.id);
                 traces.push(trace);
             }
         }
@@ -196,20 +201,13 @@ const selectTypes = (index: ProjectIndex, classNames: string[]): TypeInfo[] => {
         return [...index.typesByFqn.values()];
     }
 
+    // 类名过滤使用与端点关键词一致的模糊匹配：简单名、全限定名都可部分输入。
     const result: TypeInfo[] = [];
-    const seen = new Set<string>();
-    for (const name of classNames) {
-        const byFqn = index.typesByFqn.get(name);
-        if (byFqn && !seen.has(byFqn.fqn)) {
-            seen.add(byFqn.fqn);
-            result.push(byFqn);
-            continue;
-        }
-        for (const candidate of index.typesByName.get(name) ?? []) {
-            if (seen.has(candidate.fqn)) continue;
-            seen.add(candidate.fqn);
-            result.push(candidate);
-        }
+    for (const type of index.typesByFqn.values()) {
+        const matched = classNames.some(
+            (name) => matchesFilterText(type.fqn, name) || matchesFilterText(type.name, name),
+        );
+        if (matched) result.push(type);
     }
     return result.sort((left, right) => left.fqn.localeCompare(right.fqn));
 };

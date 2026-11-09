@@ -22,13 +22,23 @@ export const selectEndpoints = (
     return endpoints.filter(
         (endpoint) =>
             matchesKeywords(endpoint, keywords) &&
-            matchesExactSelection(endpoint, classNames, methodNames) &&
+            matchesClassAndMethod(endpoint, classNames, methodNames) &&
             matchesDir(endpoint, dir),
     );
 };
 
-/** CLI/UI 输入使用的精确控制器类 + handler 方法匹配。 */
-export const matchesExactSelection = (
+/** 单个过滤词：普通文本按不区分大小写的子串匹配，`/regex/flags` 按正则匹配。 */
+export const matchesFilterText = (value: string, filter: string): boolean => {
+    const regex = parseRegex(filter);
+    if (regex) return regex.test(value);
+    return value.toLowerCase().includes(filter.toLowerCase());
+};
+
+const matchesAnyFilter = (values: readonly string[], filters: readonly string[]): boolean =>
+    filters.some((filter) => values.some((value) => matchesFilterText(value, filter)));
+
+/** 控制器类 / handler 方法支持模糊匹配；多个过滤词之间为 OR。 */
+export const matchesClassAndMethod = (
     endpoint: EndpointInfo,
     classNames: string[],
     methodNames: string[],
@@ -36,11 +46,11 @@ export const matchesExactSelection = (
     if (classNames.length > 0) {
         const controller = endpoint.controller.trim();
         const simpleName = controller.split(".").pop() ?? controller;
-        if (!classNames.some((name) => name === controller || name === simpleName)) return false;
+        if (!matchesAnyFilter([controller, simpleName], classNames)) return false;
     }
     if (methodNames.length > 0) {
         const handlerName = handlerMethodName(endpoint);
-        if (!handlerName || !methodNames.includes(handlerName)) return false;
+        if (!handlerName || !matchesAnyFilter([handlerName], methodNames)) return false;
     }
     return true;
 };

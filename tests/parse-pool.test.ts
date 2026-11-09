@@ -3,7 +3,7 @@ import { after, before, test } from "node:test";
 import { join } from "node:path";
 import { isSourceKind, scanProject } from "../src/scan.ts";
 import type { ParseTask } from "../src/languages/parse-file.ts";
-import { parseFilesInPool, resolveParseJobs } from "../src/parse-pool.ts";
+import { estimateParseMemoryBytes, parseFilesInPool, resolveParseJobs } from "../src/parse-pool.ts";
 import { makeTempDir, minimalJavaInterface, removeDir, writeFile } from "./test-utils.ts";
 
 const FILE_COUNT = 48;
@@ -42,6 +42,28 @@ test("resolveParseJobs keeps small batches on one thread", () => {
     assert.equal(resolveParseJobs(0, 0), 1);
     assert.equal(resolveParseJobs(1, 1000), 1);
     assert.equal(resolveParseJobs(2, 8), 1);
+});
+
+test("estimateParseMemoryBytes grows with source size", () => {
+    const small = { ...tasks[0], bytes: 16 * 1024 };
+    const large = { ...tasks[0], bytes: 3 * 1024 * 1024 };
+
+    assert.ok(estimateParseMemoryBytes(large) > estimateParseMemoryBytes(small));
+    // 极小文件也保留一个下限，避免调度器把空文件当成零成本。
+    assert.ok(estimateParseMemoryBytes({ ...tasks[0], bytes: 0 }) > 0);
+});
+
+test("oversized files still finish when the budget forces them to run alone", async () => {
+    // 至少要 25 个任务才会启动两个 worker，从而真正进入 heavy 调度路径。
+    // 源码本身很小，用伪造的 bytes 让调度器把它们全部归入 heavy 队列。
+    const oversized = tasks.slice(0, 30).map((task) => ({ ...task, bytes: 64 * 1024 * 1024 }));
+    const result = await parseFilesInPool(oversized, { root, jobs: 4 });
+
+    assert.equal(result.parsed.length, oversized.length);
+    assert.deepEqual(
+        result.parsed.map((file) => file.path),
+        oversized.map((task) => task.relPath),
+    );
 });
 
 test("parallel parsing matches the single-threaded result", async () => {

@@ -84,6 +84,7 @@ const main = async (): Promise<void> => {
             Boolean(values["no-trees"]));
 
     const toStdout = values.stdout || values.out === "-";
+    const writesSqlite = !toStdout && (format === "sqlite" || format === "both");
     /*
      * 只有「纯 SQLite 输出」才能把调用树流式写到暂存文件：
      * JSON/stdout 必须内联整棵树，--print-trees 也要在分析后继续遍历。
@@ -92,6 +93,8 @@ const main = async (): Promise<void> => {
         !toStdout && format === "sqlite" && !values["print-trees"] && !values["no-trees"]
             ? join(tmpdir(), `feign-tracer-trees-${process.pid}-${Date.now()}.ndjson`)
             : undefined;
+    // SQLite 输出同时承担项目索引持久化；JSON/stdout 不写任何文件。
+    const projectDbPath = writesSqlite ? String(values.db) : undefined;
 
     const result = await analyzeDirectoryAsync(
         {
@@ -118,7 +121,7 @@ const main = async (): Promise<void> => {
             workDb: !values["no-work-db"],
             ignore: values.ignore ? splitList(values.ignore) : [],
         },
-        { treeSpoolPath },
+        { treeSpoolPath, projectDbPath },
     );
 
     const displayMode: DisplayMode = {
@@ -147,6 +150,7 @@ const main = async (): Promise<void> => {
                 dbInfo = writeAnalysisToSqlite(result, String(values.db), {
                     merge: incremental,
                     treeSpool: treeSpoolPath,
+                    preserveProject: Boolean(projectDbPath),
                 });
             } finally {
                 removeTreeSpool(treeSpoolPath);
@@ -329,10 +333,12 @@ Options:
       --ignore <dirs>    Extra comma separated directory names to ignore
       --keyword <text>   Only build endpoints matching keyword(s); repeatable/comma
       --class-name <name>
-                         Exact controller/class simple name or FQN; repeatable/comma
+                         Fuzzy class name (simple name or FQN, substring/regex);
+                         repeatable or comma separated
       --method-name <name>
-                         Exact method name; repeatable/comma. Combine with
-                         --class-name to trace a service/interface method directly.
+                         Fuzzy method name (substring/regex); repeatable/comma.
+                         Combine with --class-name to trace a service/interface
+                         method directly.
       --no-trees         Index endpoints/traces without expanding call trees
       --rebuild-dir <dir>
                          Re-parse and rebuild only endpoints under this directory
@@ -340,7 +346,10 @@ Options:
       --cache-dir <dir>  Parse cache directory                    [.feign-tracer-cache]
       --no-work-db       Keep every method body in memory (small projects only)
       --jobs <n>         Parsing worker threads: 0 = auto, 1 = off          [0]
-      --fresh            Replace the database instead of merging incremental runs
+                         Parsing concurrency also stays within an estimated
+                         memory budget; FEIGN_TRACER_PARSE_MEMORY_MB overrides
+                         it (default 6144).
+      --fresh            Replace analysis results instead of merging; keep project index
       --list-endpoints   Print endpoints/traces with their built status
       --hide-params      Hide parameter lists in --print-trees output
       --show-param-types Show parameter types (name: Type)
@@ -375,12 +384,15 @@ Call tree filters:
     --class-filter "Controller$,Service$,ServiceImpl$,Mapper$" --exclude-self-calls
 
 Storage:
-  Default output is a SQLite database (schema v3) with the tables
+  Default output is a SQLite database (schema v4) with the tables
+  projects, project_files, project_classes, project_methods, project_calls,
   analysis, stats, modules, module_dependencies, module_edges, module_children,
   endpoints, traces, call_nodes, feign_clients, feign_client_methods,
   feign_operations, feign_operation_targets, source_files, file_dependencies,
   warnings and the views v_endpoint_overview, v_trace_overview,
   v_module_overview, v_file_overview.
+  The project_* tables persist the parsed index by base_dir; repeated scans
+  only reparse files whose mtime/size/module changed.
 
 Memory:
   Parsed method bodies are spilled to a throwaway SQLite work database and

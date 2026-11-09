@@ -23,6 +23,41 @@ const MAX_AUTO_JOBS = 8;
  */
 const MIN_FILES_PER_WORKER = 24;
 
+const MB = 1024 * 1024;
+
+/**
+ * 自动内存预算。ANTLR 的 LL 预测峰值与源码字节数近似线性，
+ * 多个 worker 同时解析大文件时最容易把进程推到几 GB 以上。
+ * 可用 FEIGN_TRACER_PARSE_MEMORY_MB 覆盖（单位 MB）。
+ */
+export const DEFAULT_PARSE_MEMORY_MB = 6144;
+
+/** worker 自身加载语法和运行时的基础内存，计入总预算但不计入单文件估算。 */
+const WORKER_BASE_MB = 128;
+
+/**
+ * 单文件解析峰值约为源码字节的 640 倍（实测 3.4MB → 约 2GB）。
+ * 这是保守估算，只用于限制并发，不参与结果计算。
+ */
+const PARSE_PEAK_MULTIPLIER = 640;
+
+/** 空文件/极小文件也至少按 64KB 估算，避免估算值趋近于 0。 */
+const MIN_TASK_BYTES = 64 * 1024;
+
+const parseMemoryBudgetMb = (): number => {
+    const raw = process.env.FEIGN_TRACER_PARSE_MEMORY_MB;
+    if (raw === undefined || raw.trim() === "") return DEFAULT_PARSE_MEMORY_MB;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_PARSE_MEMORY_MB;
+};
+
+/**
+ * 估算单个文件在 worker 内的峰值。返回值不含 worker 基础内存；
+ * 调度器会先预留 `jobs × WORKER_BASE_MB`，再把剩余预算分给在途文件。
+ */
+export const estimateParseMemoryBytes = (task: ParseTask): number =>
+    Math.max(task.bytes ?? 0, MIN_TASK_BYTES) * PARSE_PEAK_MULTIPLIER;
+
 export interface ParsePoolOptions extends ParseCacheOptions {
     /** 0 表示按 CPU 核数自动选择，1 表示禁用并行。 */
     readonly jobs?: number;
@@ -44,12 +79,21 @@ export interface ParsePoolResult {
     readonly jobs: number;
 }
 
-/** 计算实际并发度，并保证小项目不会为 worker 启动时间买单。 */
+/**
+ * 计算实际并发度，并保证小项目不会为 worker 启动时间买单。
+ *
+ * 这里只限制 worker 数量；真正决定「哪些文件可以同时解析」的是
+ * `runPool` 里的字节预算调度，避免一个超大文件把所有并发都吃掉。
+ */
 export const resolveParseJobs = (requested: number, taskCount: number): number => {
     if (requested === 1 || taskCount === 0) return 1;
     const cores = Math.max(1, availableParallelism());
     const wanted = requested > 0 ? requested : Math.min(cores, MAX_AUTO_JOBS);
-    const jobs = Math.max(1, Math.min(wanted, cores, Math.ceil(taskCount / MIN_FILES_PER_WORKER)));
+    const byBudget = Math.max(1, Math.floor((parseMemoryBudgetMb() * MB) / (WORKER_BASE_MB * MB)));
+    const jobs = Math.max(
+        1,
+        Math.min(wanted, cores, byBudget, Math.ceil(taskCount / MIN_FILES_PER_WORKER)),
+    );
     return jobs;
 };
 
@@ -86,11 +130,12 @@ const createWorker = (cache: ParseCacheOptions | undefined): Worker => {
 type Deliver = (index: number, outcome: ParseTaskOutcome) => void;
 
 /**
- * 动态逐文件派发。
+ * 动态逐文件派发，并按字节预算限制同时在途的大文件。
  *
- * 相比「按文件数切批」，这里由 worker 完成一个就领一个：
- * 每个 worker 的堆上最多只有正在解析的那一个文件（加上 postMessage 的
- * 结构化克隆副本），负载也天然均衡，不需要预估单文件耗时或字节数。
+ * 每个 worker 的堆上最多只有正在解析的那一个文件；调度器再根据源码大小
+ * 估算峰值，只有「已预留的 worker 基础内存 + 在途文件估算」不超过总预算时才
+ * 继续派发。超过单次预算的超大文件会进入 `heavy` 队列，独占一个 worker 运行。
+ * 这样既保留小文件的并发度，也避免 8 个大文件同时把内存推到十几 GB。
  */
 const runPool = (
     tasks: readonly ParseTask[],
@@ -101,7 +146,22 @@ const runPool = (
     const workers: Worker[] = [];
     /** worker -> 当前在途任务下标 */
     const busy = new Map<Worker, number>();
-    let nextIndex = 0;
+    /** 可以在预算内并行派发的普通文件。 */
+    const light: number[] = [];
+    /** 估算超过单次预算、必须独占运行的文件。 */
+    const heavy: number[] = [];
+
+    const budgetBytes = parseMemoryBudgetMb() * MB;
+    const taskBudgetBytes = Math.max(
+        MIN_TASK_BYTES * PARSE_PEAK_MULTIPLIER,
+        budgetBytes - jobs * WORKER_BASE_MB * MB,
+    );
+    for (let index = 0; index < tasks.length; index++) {
+        const estimate = estimateParseMemoryBytes(tasks[index]);
+        (estimate > taskBudgetBytes ? heavy : light).push(index);
+    }
+
+    let activeBytes = 0;
     let settled = false;
 
     return new Promise<void>((resolve, reject) => {
@@ -120,13 +180,45 @@ const runPool = (
             void terminateAll().then(() => reject(error));
         };
 
-        const dispatch = (worker: Worker): void => {
-            if (settled || nextIndex >= tasks.length) return;
-            const taskId = nextIndex;
-            nextIndex++;
-            busy.set(worker, taskId);
-            const request: ParseTaskRequest = { type: "task", taskId, task: tasks[taskId] };
-            worker.postMessage(request);
+        const allDone = (): boolean => light.length === 0 && heavy.length === 0 && busy.size === 0;
+
+        const takeTask = (): number | undefined => {
+            const nextLight = light[0];
+            if (nextLight !== undefined) {
+                const estimate = estimateParseMemoryBytes(tasks[nextLight]);
+                // 空闲 worker 至少能领一个任务；有在途任务时必须留在预算内。
+                if (busy.size === 0 || activeBytes + estimate <= taskBudgetBytes) {
+                    light.shift();
+                    activeBytes += estimate;
+                    return nextLight;
+                }
+                return undefined;
+            }
+
+            // 超大文件独占运行，等所有在途任务结束后再派发。
+            if (heavy.length === 0 || busy.size > 0) return undefined;
+            const nextHeavy = heavy.shift();
+            if (nextHeavy === undefined) return undefined;
+            activeBytes = estimateParseMemoryBytes(tasks[nextHeavy]);
+            return nextHeavy;
+        };
+
+        const pump = (): void => {
+            if (settled) return;
+            for (const worker of workers) {
+                if (busy.has(worker)) continue;
+                const taskId = takeTask();
+                if (taskId === undefined) break;
+                busy.set(worker, taskId);
+                const request: ParseTaskRequest = { type: "task", taskId, task: tasks[taskId] };
+                try {
+                    worker.postMessage(request);
+                } catch (error) {
+                    fail(error instanceof Error ? error : new Error(String(error)));
+                    return;
+                }
+            }
+            if (allDone()) finish();
         };
 
         try {
@@ -139,29 +231,35 @@ const runPool = (
                     const taskId = busy.get(worker);
                     if (taskId === undefined || message.taskId !== taskId) return;
                     busy.delete(worker);
+                    activeBytes = Math.max(
+                        0,
+                        activeBytes - estimateParseMemoryBytes(tasks[taskId]),
+                    );
 
                     if (message.type === "error") {
                         fail(new Error(`parse worker failed: ${message.message}`));
                         return;
                     }
-                    deliver(taskId, message.outcome);
-                    dispatch(worker);
-                    if (nextIndex >= tasks.length && busy.size === 0) finish();
+                    try {
+                        deliver(taskId, message.outcome);
+                    } catch (error) {
+                        fail(error instanceof Error ? error : new Error(String(error)));
+                        return;
+                    }
+                    pump();
                 });
                 worker.on("error", (error: Error) => fail(error));
                 worker.on("exit", (code) => {
                     if (settled) return;
                     fail(new Error(`parse worker exited unexpectedly with code ${code}`));
                 });
-
-                dispatch(worker);
             }
         } catch (error) {
             fail(error instanceof Error ? error : new Error(String(error)));
             return;
         }
 
-        if (tasks.length === 0) finish();
+        pump();
     });
 };
 

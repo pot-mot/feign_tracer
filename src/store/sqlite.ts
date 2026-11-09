@@ -1,311 +1,36 @@
-import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import sqlite3 from "node-sqlite3-wasm";
 import type { Database as DatabaseType, Statement as StatementType } from "node-sqlite3-wasm";
 import type { AnalysisResult, CallTreeNode, ModuleDependency } from "../model.ts";
 import type { DeepReadonly } from "../types.ts";
 import { readTreeSpool } from "./tree-spool.ts";
+import { hasProjectTables } from "./project.ts";
+import {
+    METADATA_TABLES,
+    PROJECT_TABLES,
+    SCHEMA,
+    SCHEMA_VERSION,
+    TABLE_NAMES,
+    VIEW_NAMES,
+    VIEWS,
+} from "./schema.ts";
 
 const { Database } = sqlite3;
 
-/** 架构变化时递增，存入 PRAGMA user_version。 */
-export const SQLITE_SCHEMA_VERSION = 3;
-
-const TABLES = `
-CREATE TABLE analysis (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  root          TEXT NOT NULL,
-  generated_at  TEXT NOT NULL,
-  tool          TEXT NOT NULL,
-  version       TEXT NOT NULL,
-  options_json  TEXT NOT NULL,
-  duration_ms   INTEGER NOT NULL
-);
-
-CREATE TABLE stats (
-  name  TEXT PRIMARY KEY,
-  value INTEGER NOT NULL
-);
-
-CREATE TABLE warnings (
-  id      INTEGER PRIMARY KEY,
-  message TEXT NOT NULL
-);
-
-CREATE TABLE modules (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  build_tool  TEXT NOT NULL,
-  dir         TEXT NOT NULL,
-  build_file  TEXT,
-  parent_id   TEXT,
-  group_id    TEXT,
-  artifact_id TEXT,
-  version     TEXT,
-  file_count  INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE module_dependencies (
-  id            INTEGER PRIMARY KEY,
-  module_id     TEXT NOT NULL,
-  to_module     TEXT,
-  group_id      TEXT,
-  artifact_id   TEXT,
-  version       TEXT,
-  scope         TEXT,
-  configuration TEXT,
-  optional      INTEGER NOT NULL DEFAULT 0,
-  external      INTEGER NOT NULL DEFAULT 0,
-  raw           TEXT
-);
-CREATE INDEX idx_module_dependencies_module ON module_dependencies(module_id);
-CREATE INDEX idx_module_dependencies_target ON module_dependencies(to_module);
-
-CREATE TABLE module_edges (
-  from_module TEXT NOT NULL,
-  to_module   TEXT NOT NULL,
-  count       INTEGER NOT NULL,
-  PRIMARY KEY (from_module, to_module)
-);
-
-CREATE TABLE module_children (
-  parent_id TEXT NOT NULL,
-  child_id  TEXT NOT NULL,
-  position  INTEGER NOT NULL,
-  PRIMARY KEY (parent_id, child_id)
-);
-
-CREATE TABLE endpoints (
-  id            TEXT PRIMARY KEY,
-  http_method   TEXT NOT NULL,
-  paths_json    TEXT NOT NULL,
-  handler       TEXT NOT NULL,
-  handler_label TEXT NOT NULL,
-  controller    TEXT NOT NULL,
-  module_id     TEXT,
-  file          TEXT,
-  line          INTEGER,
-  tree_built    INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_endpoints_controller ON endpoints(controller);
-CREATE INDEX idx_endpoints_module ON endpoints(module_id);
-
-CREATE TABLE call_nodes (
-  root_type        TEXT NOT NULL DEFAULT 'endpoint',
-  endpoint_id      TEXT NOT NULL,
-  seq              TEXT NOT NULL,
-  path             TEXT NOT NULL,
-  sort_key         TEXT NOT NULL,
-  parent_seq       TEXT,
-  node_order       INTEGER NOT NULL,
-  depth            INTEGER NOT NULL,
-  method_id        TEXT NOT NULL,
-  label            TEXT NOT NULL,
-  signature        TEXT,
-  params_json      TEXT,
-  visibility       TEXT,
-  kind             TEXT NOT NULL,
-  module_id        TEXT,
-  file             TEXT,
-  line             INTEGER,
-  annotations_json TEXT,
-  call_count       INTEGER NOT NULL DEFAULT 1,
-  unresolved       INTEGER NOT NULL DEFAULT 0,
-  cyclic           INTEGER NOT NULL DEFAULT 0,
-  implementation_of TEXT,
-  feign_service    TEXT,
-  feign_http_method TEXT,
-  feign_path       TEXT,
-  remote_endpoint  TEXT,
-  remote_service   TEXT,
-  PRIMARY KEY (root_type, endpoint_id, seq)
-);
-CREATE INDEX idx_call_nodes_parent ON call_nodes(root_type, endpoint_id, parent_seq);
-CREATE INDEX idx_call_nodes_sort ON call_nodes(root_type, endpoint_id, sort_key);
-CREATE INDEX idx_call_nodes_method ON call_nodes(method_id);
-CREATE INDEX idx_call_nodes_kind ON call_nodes(kind);
-
-CREATE TABLE traces (
-  id                TEXT PRIMARY KEY,
-  class_name        TEXT NOT NULL,
-  method_name       TEXT NOT NULL,
-  label             TEXT NOT NULL,
-  kind              TEXT NOT NULL,
-  module_id         TEXT,
-  file              TEXT,
-  line              INTEGER,
-  implementation_of TEXT,
-  tree_built        INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_traces_class ON traces(class_name);
-CREATE INDEX idx_traces_module ON traces(module_id);
-
-CREATE TABLE feign_clients (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  service_name TEXT,
-  url          TEXT,
-  module_id    TEXT,
-  file         TEXT,
-  line         INTEGER
-);
-
-CREATE TABLE feign_client_methods (
-  client_id   TEXT NOT NULL,
-  method_id   TEXT NOT NULL,
-  name        TEXT NOT NULL,
-  http_method TEXT NOT NULL,
-  paths_json  TEXT NOT NULL,
-  signature   TEXT NOT NULL,
-  position    INTEGER NOT NULL,
-  PRIMARY KEY (client_id, method_id)
-);
-
-CREATE TABLE feign_operations (
-  method_id    TEXT NOT NULL,
-  path         TEXT NOT NULL,
-  client_name  TEXT NOT NULL,
-  client_id    TEXT,
-  service_name TEXT,
-  url          TEXT,
-  method_name  TEXT NOT NULL,
-  http_method  TEXT NOT NULL,
-  module_id    TEXT,
-  file         TEXT,
-  line         INTEGER,
-  PRIMARY KEY (method_id, path)
-);
-CREATE INDEX idx_feign_operations_client ON feign_operations(client_id);
-
-CREATE TABLE feign_operation_targets (
-  method_id    TEXT NOT NULL,
-  path         TEXT NOT NULL,
-  endpoint_ref TEXT NOT NULL,
-  PRIMARY KEY (method_id, path, endpoint_ref)
-);
-
-CREATE TABLE source_files (
-  path           TEXT PRIMARY KEY,
-  language       TEXT NOT NULL,
-  module_id      TEXT,
-  package_name   TEXT NOT NULL,
-  imports_json   TEXT NOT NULL,
-  types_json     TEXT NOT NULL,
-  calls          INTEGER NOT NULL DEFAULT 0,
-  parse_errors   INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX idx_source_files_module ON source_files(module_id);
-
-CREATE TABLE file_dependencies (
-  file_path TEXT NOT NULL,
-  to_type   TEXT NOT NULL,
-  count     INTEGER NOT NULL,
-  kinds_json TEXT NOT NULL,
-  lines_json TEXT NOT NULL,
-  PRIMARY KEY (file_path, to_type)
-);
-CREATE INDEX idx_file_dependencies_target ON file_dependencies(to_type);
-`;
-
-const VIEWS = `
-CREATE VIEW v_endpoint_overview AS
-SELECT
-  e.id,
-  e.http_method,
-  e.paths_json,
-  e.controller,
-  e.module_id,
-  e.file,
-  e.tree_built,
-  (SELECT COUNT(*) FROM call_nodes n WHERE n.root_type = 'endpoint' AND n.endpoint_id = e.id) AS node_count,
-  (SELECT COUNT(*) FROM call_nodes n WHERE n.root_type = 'endpoint' AND n.endpoint_id = e.id AND n.kind = 'feign') AS feign_calls,
-  (SELECT COUNT(*) FROM call_nodes n WHERE n.root_type = 'endpoint' AND n.endpoint_id = e.id AND n.depth = 0) AS root_nodes
-FROM endpoints e;
-
-CREATE VIEW v_trace_overview AS
-SELECT
-  t.id,
-  t.class_name,
-  t.method_name,
-  t.label,
-  t.kind,
-  t.module_id,
-  t.file,
-  t.implementation_of,
-  t.tree_built,
-  (SELECT COUNT(*) FROM call_nodes n WHERE n.root_type = 'trace' AND n.endpoint_id = t.id) AS node_count,
-  (SELECT COUNT(*) FROM call_nodes n WHERE n.root_type = 'trace' AND n.endpoint_id = t.id AND n.kind = 'feign') AS feign_calls
-FROM traces t;
-
-CREATE VIEW v_module_overview AS
-SELECT
-  m.*,
-  (SELECT COUNT(*) FROM module_dependencies d WHERE d.module_id = m.id) AS dependency_count,
-  (SELECT COUNT(*) FROM module_dependencies d WHERE d.to_module = m.id) AS dependent_count
-FROM modules m;
-
-CREATE VIEW v_file_overview AS
-SELECT
-  f.path,
-  f.language,
-  f.module_id,
-  f.package_name,
-  f.calls,
-  (SELECT COUNT(*) FROM file_dependencies d WHERE d.file_path = f.path) AS dependency_count
-FROM source_files f;
-`;
-
-const SCHEMA = `${TABLES}\n${VIEWS}`;
-
-const VIEW_NAMES = [
-    "v_endpoint_overview",
-    "v_trace_overview",
-    "v_module_overview",
-    "v_file_overview",
-];
-
-const TABLE_NAMES = [
-    "analysis",
-    "stats",
-    "warnings",
-    "modules",
-    "module_dependencies",
-    "module_edges",
-    "module_children",
-    "endpoints",
-    "call_nodes",
-    "traces",
-    "feign_clients",
-    "feign_client_methods",
-    "feign_operations",
-    "feign_operation_targets",
-    "source_files",
-    "file_dependencies",
-] as const;
-
-const METADATA_TABLES = [
-    "analysis",
-    "stats",
-    "warnings",
-    "modules",
-    "module_dependencies",
-    "module_edges",
-    "module_children",
-    "endpoints",
-    "traces",
-    "feign_clients",
-    "feign_client_methods",
-    "feign_operations",
-    "feign_operation_targets",
-    "source_files",
-    "file_dependencies",
-] as const;
+export const SQLITE_SCHEMA_VERSION = SCHEMA_VERSION;
 
 export interface SqliteWriteResult {
     readonly path: string;
     readonly bytes: number;
     readonly rowCounts: Readonly<Record<string, number>>;
 }
+
+const normalizeBaseDir = (value: string): string =>
+    value.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+
+const text = (value: unknown): string | undefined =>
+    typeof value === "string" ? value : undefined;
 
 export interface SqliteWriteOptions {
     /** 保留本次未重建端点的调用树；增量/目录重建模式依赖该选项。 */
@@ -315,6 +40,11 @@ export interface SqliteWriteOptions {
      * 而不是遍历 `result.endpoints[].tree`——后者要求所有端点的树同时驻留内存。
      */
     readonly treeSpool?: string;
+    /**
+     * 全新写入时保留旧库中的项目索引表（projects/project_files/...）。
+     * 分析阶段已按项目索引完成复用，因此整库替换不能把索引一起丢掉。
+     */
+    readonly preserveProject?: boolean;
 }
 
 /**
@@ -330,14 +60,179 @@ export const writeAnalysisToSqlite = (
     mkdirSync(dirname(dbPath), { recursive: true });
     if (options.merge && existsSync(dbPath))
         return mergeAnalysis(result, dbPath, options.treeSpool);
-    return createAnalysis(result, dbPath, options.treeSpool);
+    return createAnalysis(result, dbPath, options.treeSpool, options.preserveProject === true);
+};
+
+const nowIso = (): string => new Date().toISOString();
+
+const quoteSqlIdentifier = (value: string): string => `"${value.replace(/"/g, '""')}"`;
+
+const hasTable = (db: DatabaseType, name: string): boolean => {
+    const row = db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [name]);
+    return typeof row?.name === "string";
+};
+
+/**
+ * 自动迁移历史数据：
+ * - 删除旧版本遗留、且不属于当前 schema 的表/视图；
+ * - 用 analysis.root 回填缺失的 projects.base_dir；
+ * - 统一历史项目路径分隔符。
+ *
+ * 该函数由 schema 迁移和只读功能入口自动调用，不再依赖独立命令。
+ */
+const migrateHistoricalData = (db: DatabaseType): void => {
+    const knownObjects = new Set<string>([...TABLE_NAMES, ...VIEW_NAMES]);
+    const objects = db.all(
+        `SELECT type, name FROM sqlite_master
+         WHERE type IN ('table', 'view')
+           AND name NOT LIKE 'sqlite_%'
+         ORDER BY CASE type WHEN 'view' THEN 0 ELSE 1 END, name`,
+    );
+    for (const row of objects) {
+        const name = text(row.name);
+        const type = text(row.type);
+        if (!name || !type || knownObjects.has(name)) continue;
+        db.exec(`DROP ${type === "view" ? "VIEW" : "TABLE"} IF EXISTS ${quoteSqlIdentifier(name)}`);
+    }
+
+    if (!hasTable(db, "projects")) return;
+
+    if (hasTable(db, "analysis")) {
+        const analysis = db.get("SELECT root, generated_at FROM analysis WHERE id = 1");
+        const root = text(analysis?.root);
+        if (root) {
+            const baseDir = normalizeBaseDir(root);
+            const existing = db.get("SELECT id FROM projects WHERE base_dir = ? COLLATE NOCASE", [
+                baseDir,
+            ]);
+            if (typeof existing?.id !== "number") {
+                const insertProject = db.prepare(
+                    "INSERT INTO projects (base_dir, created_at, updated_at) VALUES (?, ?, ?)",
+                );
+                try {
+                    insertProject.run([
+                        baseDir,
+                        text(analysis?.generated_at) ?? nowIso(),
+                        nowIso(),
+                    ]);
+                } finally {
+                    insertProject.finalize();
+                }
+            }
+        }
+    }
+
+    const projects = db.all("SELECT id, base_dir FROM projects");
+    const updateProject = db.prepare("UPDATE projects SET base_dir = ? WHERE id = ?");
+    try {
+        for (const project of projects) {
+            const id = project.id;
+            const raw = text(project.base_dir);
+            if (typeof id !== "number" || !raw) continue;
+            const normalized = normalizeBaseDir(raw);
+            if (normalized !== raw) updateProject.run([normalized, id]);
+        }
+    } finally {
+        updateProject.finalize();
+    }
+};
+
+const ensuredDatabases = new Map<string, string>();
+
+const fingerprintOf = (dbPath: string): string | undefined => {
+    try {
+        const stat = statSync(dbPath);
+        return `${stat.mtimeMs}:${stat.size}`;
+    } catch {
+        return undefined;
+    }
+};
+
+/**
+ * 只读检查数据库是否已经满足当前 schema 与历史数据要求。
+ * 这样普通读取不会在分析写入期间反复打开写连接，避免 SQLITE_BUSY。
+ */
+const isDatabaseReadyForRead = (dbPath: string): boolean => {
+    const db = new Database(dbPath, { readOnly: true });
+    try {
+        const versionRaw = db.get("PRAGMA user_version")?.user_version;
+        const version = typeof versionRaw === "number" ? versionRaw : 0;
+        if (version !== SQLITE_SCHEMA_VERSION) return false;
+        if (!hasTable(db, "projects")) return false;
+
+        const knownObjects = new Set<string>([...TABLE_NAMES, ...VIEW_NAMES]);
+        const objects = db.all(
+            `SELECT name FROM sqlite_master
+             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'`,
+        );
+        if (objects.some((row) => !knownObjects.has(text(row.name) ?? ""))) return false;
+
+        if (hasTable(db, "analysis")) {
+            const analysis = db.get("SELECT root FROM analysis WHERE id = 1");
+            const root = text(analysis?.root);
+            if (root) {
+                const baseDir = normalizeBaseDir(root);
+                const project = db.get(
+                    "SELECT id FROM projects WHERE base_dir = ? COLLATE NOCASE",
+                    [baseDir],
+                );
+                if (typeof project?.id !== "number") return false;
+            }
+        }
+        return true;
+    } finally {
+        db.close();
+    }
+};
+
+/**
+ * 在读取项目/浏览数据库/分析前确保旧库已经完成自动迁移。
+ * 已是最新状态时只做只读检查，避免写锁干扰正在进行的分析。
+ */
+export const ensureDatabaseReady = (targetPath: string): void => {
+    const dbPath = resolve(targetPath);
+    if (!existsSync(dbPath)) return;
+    const fingerprint = fingerprintOf(dbPath);
+    if (!fingerprint) return;
+    if (ensuredDatabases.get(dbPath) === fingerprint) return;
+
+    try {
+        if (isDatabaseReadyForRead(dbPath)) {
+            ensuredDatabases.set(dbPath, fingerprint);
+            return;
+        }
+    } catch {
+        // 数据库正在被分析写入时可能短暂无法读取；保持现状，下一次再迁移。
+        return;
+    }
+
+    try {
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA foreign_keys = ON");
+            if (migrateSchema(db) === "recreate") return;
+        } finally {
+            db.close();
+        }
+    } catch {
+        // 写锁被占用时不要影响读取/分析主流程。
+        return;
+    }
+
+    const after = fingerprintOf(dbPath);
+    if (after) ensuredDatabases.set(dbPath, after);
 };
 
 const createAnalysis = (
     result: DeepReadonly<AnalysisResult>,
     dbPath: string,
     treeSpool: string | undefined,
+    preserveProject: boolean,
 ): SqliteWriteResult => {
+    if (preserveProject && existsSync(dbPath) && hasProjectTables(dbPath)) {
+        return replaceAnalysisPreservingProject(result, dbPath, treeSpool);
+    }
+
     const tempPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
     const db = new Database(tempPath);
     try {
@@ -389,6 +284,69 @@ const createAnalysis = (
     }
 };
 
+/**
+ * 全新分析时保留已持久化的项目索引。
+ *
+ * 复制旧库到临时文件后只清空分析元数据表，项目索引（projects 及其子表）
+ * 原样保留；这样强制重扫描/首次全量分析不会把可复用索引一起丢掉。
+ */
+const replaceAnalysisPreservingProject = (
+    result: DeepReadonly<AnalysisResult>,
+    dbPath: string,
+    treeSpool: string | undefined,
+): SqliteWriteResult => {
+    const tempPath = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
+    copyFileSync(dbPath, tempPath);
+    const db = new Database(tempPath);
+    try {
+        if (migrateSchema(db) === "recreate") {
+            throw new Error("Cannot preserve project index from an incompatible database schema");
+        }
+        db.exec("PRAGMA journal_mode = OFF");
+        db.exec("PRAGMA synchronous = OFF");
+        db.exec("PRAGMA temp_store = FILE");
+        db.exec("PRAGMA cache_size = -32768");
+
+        for (const table of METADATA_TABLES) db.exec(`DELETE FROM ${table}`);
+        db.exec("DELETE FROM call_nodes");
+
+        const statements = prepareStatements(db);
+        db.exec("BEGIN");
+        try {
+            insertAnalysis(statements, result, treeSpool);
+            db.exec("COMMIT");
+        } catch (error) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // 忽略回滚错误；临时文件随后会被删除。
+            }
+            throw error;
+        }
+
+        db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+        const rowCounts = countRows(db);
+        finalizeStatements(statements);
+        db.close();
+        // Windows 上刚关闭的连接可能仍短暂持有目标文件；直接复制覆盖更稳。
+        copyFileSync(tempPath, dbPath);
+        unlinkSync(tempPath);
+        return { path: dbPath, bytes: statSync(dbPath).size, rowCounts };
+    } catch (error) {
+        try {
+            db.close();
+        } catch {
+            // 忽略失败写入时的关闭错误。
+        }
+        try {
+            unlinkSync(tempPath);
+        } catch {
+            // 临时文件可能从未创建成功，忽略。
+        }
+        throw error;
+    }
+};
+
 const mergeAnalysis = (
     result: DeepReadonly<AnalysisResult>,
     dbPath: string,
@@ -399,7 +357,7 @@ const mergeAnalysis = (
         if (migrateSchema(db) === "recreate") {
             // 旧库结构无法原地升级：关闭连接后整库重建，由 createAnalysis 原子替换。
             db.close();
-            return createAnalysis(result, dbPath, treeSpool);
+            return createAnalysis(result, dbPath, treeSpool, false);
         }
 
         db.exec("PRAGMA synchronous = NORMAL");
@@ -497,7 +455,12 @@ const mergeAnalysis = (
 const migrateSchema = (db: DatabaseType): "ok" | "recreate" => {
     const rawVersion = db.get("PRAGMA user_version")?.user_version;
     const version = typeof rawVersion === "number" ? rawVersion : 0;
-    if (version === SQLITE_SCHEMA_VERSION) return "ok";
+    if (version === SQLITE_SCHEMA_VERSION) {
+        // 即使版本已最新，也处理旧库遗留表/项目回填等历史数据。
+        db.exec(PROJECT_TABLES);
+        migrateHistoricalData(db);
+        return "ok";
+    }
     if (version > SQLITE_SCHEMA_VERSION) {
         throw new Error(
             `Database schema v${version} is newer than supported v${SQLITE_SCHEMA_VERSION}`,
@@ -532,8 +495,11 @@ const migrateSchema = (db: DatabaseType): "ok" | "recreate" => {
     CREATE INDEX IF NOT EXISTS idx_traces_class ON traces(class_name);
     CREATE INDEX IF NOT EXISTS idx_traces_module ON traces(module_id);
   `);
+    // v4 新增项目索引表；旧库原地补表，下次扫描即可复用已有源码结果。
+    db.exec(PROJECT_TABLES);
     for (const view of VIEW_NAMES) db.exec(`DROP VIEW IF EXISTS ${view}`);
     db.exec(VIEWS);
+    migrateHistoricalData(db);
     db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
     return "ok";
 };

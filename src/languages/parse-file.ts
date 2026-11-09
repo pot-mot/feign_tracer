@@ -11,6 +11,13 @@ export interface ParseTask {
     readonly relPath: string;
     readonly kind: SourceScanKind;
     readonly moduleId?: string;
+    /**
+     * 源码字节数。主线程用它估算单个文件的解析峰值，并限制同时解析的
+     * 大文件数量；缓存命中时不会重新读取该字段。
+     */
+    readonly bytes?: number;
+    /** 文件最后修改时间，用于与数据库中的项目索引比对是否需要重新解析。 */
+    readonly mtimeMs?: number;
 }
 
 /** 单文件解析结果；失败时仍返回占位 ParsedFile，保证后续分析不中断。 */

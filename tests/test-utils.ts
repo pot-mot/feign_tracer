@@ -13,7 +13,8 @@ export const writeFile = (root: string, relPath: string, content: string): strin
 };
 
 export const removeDir = (dir: string): void => {
-    rmSync(dir, { recursive: true, force: true });
+    // Windows 上 SQLite 关闭连接后文件句柄可能延迟释放，给 rmSync 少量重试。
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 };
 
 /**

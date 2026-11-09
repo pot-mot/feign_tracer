@@ -13,17 +13,25 @@ import type { DeepReadonly } from "./types.ts";
 import { isSourceKind, scanProject, type ScannedFile } from "./scan.ts";
 import { buildMavenModules, parsePom } from "./build/maven.ts";
 import { buildGradleModules, parseGradleSettings, type GradleSettings } from "./build/gradle.ts";
-import { createProjectIndex } from "./graph/index.ts";
+import { createProjectIndex, type ProjectIndex } from "./graph/index.ts";
 import { buildEndpoints, linkFeignEndpoints } from "./graph/endpoints.ts";
 import { buildCallTrees, buildTraceTrees } from "./graph/calls.ts";
 import { analyzeFiles } from "./graph/files.ts";
 import { selectEndpoints } from "./graph/select.ts";
 import { buildMethodTraces, filterTracesByKeywords } from "./graph/traces.ts";
+import { resolveCalls } from "./graph/resolve.ts";
 import { createParseCache, type ParseCacheOptions } from "./cache.ts";
 import { parseTask, type ParseTask, type ParseTaskOutcome } from "./languages/parse-file.ts";
 import { parseFilesInPool } from "./parse-pool.ts";
 import { createBodyStore, detachBodies, type BodyStore } from "./store/bodies.ts";
 import { createTreeSpool, type TreeSpool } from "./store/tree-spool.ts";
+import { ensureDatabaseReady } from "./store/sqlite.ts";
+import {
+    createProjectWriter,
+    loadProjectManifest,
+    loadReusedProjectFiles,
+    type ProjectWriter,
+} from "./store/project.ts";
 
 const TOOL_VERSION = "1.0.0";
 
@@ -69,6 +77,11 @@ export interface AnalyzeAsyncOptions {
      * `writeAnalysisToSqlite` 的 `treeSpool` 选项。
      */
     readonly treeSpoolPath?: string;
+    /**
+     * 项目索引持久化数据库。提供后优先按 `projects.base_dir` 复用已解析文件，
+     * 只对新增/修改/删除的文件更新数据库中的项目索引。
+     */
+    readonly projectDbPath?: string;
 }
 
 interface GradleBuildFile {
@@ -91,10 +104,26 @@ interface PreparedAnalysis {
     readonly settingsFiles: ScannedFile[];
     readonly gradleBuildFiles: GradleBuildFile[];
     readonly modules: ModuleInfo[];
-    readonly classFilterRegexes: RegExp[];
     readonly tasks: ParseTask[];
     readonly taskModules: Array<ModuleInfo | undefined>;
     readonly cacheOptions: ParseCacheOptions | undefined;
+}
+
+/**
+ * 可复用的项目分析基座。
+ *
+ * 它只包含与「选择哪些调用树」无关的部分：扫描得到的模块、解析后的符号索引、
+ * 文件依赖与底层解析警告。调用树选项（关键词、深度、类名过滤等）在
+ * `finalizeAnalysis` 中应用，因此同一份基座可以服务多次增量构建。
+ */
+interface AnalysisBase {
+    readonly prepared: PreparedAnalysis;
+    readonly parsedFiles: ParsedFile[];
+    readonly index: ProjectIndex;
+    readonly files: AnalysisResult["files"];
+    readonly calls: number;
+    readonly resolvedCalls: number;
+    readonly warnings: string[];
 }
 
 /** 每落库这么多方法体提交一次事务，避免回滚日志和页缓存无限增长。 */
@@ -126,7 +155,14 @@ export const analyzeDirectory = (
             const outcome = parseTask(prepared.tasks[index], cache);
             acceptOutcome(prepared, accumulator, store, index, outcome);
         }
-        return finalizeAnalysis(prepared, accumulator, store, undefined);
+        const base = createAnalysisBase(
+            prepared,
+            accumulator,
+            store,
+            prepared.options.includeSource,
+            accumulator.calls,
+        );
+        return finalizeAnalysis(base, prepared.options, prepared.started, undefined);
     } finally {
         store?.close();
     }
@@ -140,27 +176,194 @@ export const analyzeDirectoryAsync = async (
     input: Partial<AnalyzeOptions> & { root: string },
     asyncOptions: AnalyzeAsyncOptions = {},
 ): Promise<DeepReadonly<AnalysisResult>> => {
+    if (asyncOptions.projectDbPath) ensureDatabaseReady(asyncOptions.projectDbPath);
     const prepared = prepareAnalysis(input);
     const store = prepared.options.workDb ? createBodyStore() : undefined;
+    let writer: ProjectWriter | undefined;
     try {
+        const plan = planProjectReuse(
+            prepared,
+            asyncOptions.projectDbPath,
+            input.forceReparse === true,
+        );
         const accumulator = createAccumulator(prepared);
-        const poolResult = await parseFilesInPool(prepared.tasks, {
-            ...(prepared.cacheOptions ?? { root: prepared.root }),
-            jobs: prepared.options.parseWorkers,
-            onProgress: asyncOptions.onProgress,
-            onFile: (index, outcome) => acceptOutcome(prepared, accumulator, store, index, outcome),
-        });
-        prepared.warnings.push(...poolResult.warnings);
-        return finalizeAnalysis(prepared, accumulator, store, asyncOptions.treeSpoolPath);
+
+        // 复用文件与本次解析文件走同一条接收路径，保证统计口径一致。
+        for (let index = 0; index < prepared.tasks.length; index++) {
+            const parsed = plan.reused.get(prepared.tasks[index].relPath);
+            if (!parsed) continue;
+            acceptOutcome(prepared, accumulator, store, index, { parsed, cacheHit: true });
+        }
+
+        if (
+            asyncOptions.projectDbPath &&
+            (plan.tasksToParse.length > 0 || plan.removed.length > 0)
+        ) {
+            writer = createProjectWriter(asyncOptions.projectDbPath, prepared.root);
+            writer.removeFiles(plan.removed);
+        }
+
+        if (plan.tasksToParse.length > 0) {
+            const poolResult = await parseFilesInPool(plan.tasksToParse, {
+                ...(prepared.cacheOptions ?? { root: prepared.root }),
+                jobs: prepared.options.parseWorkers,
+                onProgress: asyncOptions.onProgress,
+                onFile: (subsetIndex, outcome) => {
+                    const taskIndex = plan.taskIndexes[subsetIndex];
+                    writer?.saveFile(prepared.tasks[taskIndex], outcome.parsed);
+                    acceptOutcome(prepared, accumulator, store, taskIndex, outcome);
+                },
+            });
+            prepared.warnings.push(...poolResult.warnings);
+        }
+
+        const base = createAnalysisBase(
+            prepared,
+            accumulator,
+            store,
+            prepared.options.includeSource,
+            accumulator.calls,
+        );
+
+        if (writer) {
+            // 调用边需要完整索引才能解析；只更新本次写入文件对应的行。
+            writer.updateCallees((methodKey) => {
+                const method = base.index.methodById.get(methodKey);
+                if (!method) return [];
+                return resolveCalls(base.index, method).map((entry) => entry.target?.id);
+            });
+            writer.close();
+            writer = undefined;
+        }
+
+        return finalizeAnalysis(
+            base,
+            prepared.options,
+            prepared.started,
+            asyncOptions.treeSpoolPath,
+        );
     } finally {
+        writer?.abort();
         store?.close();
     }
+};
+
+interface ProjectReusePlan {
+    readonly reused: ReadonlyMap<string, ParsedFile>;
+    readonly tasksToParse: readonly ParseTask[];
+    readonly taskIndexes: readonly number[];
+    readonly removed: readonly string[];
+}
+
+/**
+ * 根据项目索引数据库规划本次需要解析的文件。
+ *
+ * 匹配键是文件相对路径 + mtime + size + 模块归属；命中时直接复用
+ * project_files.parsed_json 中的解析结果。删除的文件会从索引中移除，
+ * 新增或修改的文件进入解析队列。
+ */
+const planProjectReuse = (
+    prepared: PreparedAnalysis,
+    dbPath: string | undefined,
+    forceReparse: boolean,
+): ProjectReusePlan => {
+    const sourcePaths = new Set(prepared.tasks.map((task) => task.relPath));
+    const manifest = dbPath ? loadProjectManifest(dbPath, prepared.root) : undefined;
+    const removed = manifest
+        ? [...manifest.files.keys()].filter((path) => !sourcePaths.has(path))
+        : [];
+
+    if (!dbPath || !manifest || forceReparse) {
+        return {
+            reused: new Map(),
+            tasksToParse: prepared.tasks,
+            taskIndexes: prepared.tasks.map((_task, index) => index),
+            removed,
+        };
+    }
+
+    const rebuildDir = prepared.options.rebuildDir;
+    const mustReparse = (relPath: string): boolean =>
+        rebuildDir !== undefined &&
+        (rebuildDir === "." || relPath === rebuildDir || relPath.startsWith(`${rebuildDir}/`));
+
+    const candidates = new Set<string>();
+    for (const task of prepared.tasks) {
+        if (mustReparse(task.relPath)) continue;
+        const stored = manifest.files.get(task.relPath);
+        if (!stored) continue;
+        if (stored.language !== task.kind) continue;
+        if ((stored.moduleId ?? "") !== (task.moduleId ?? "")) continue;
+        // Date 精度只到毫秒，NTFS 的 mtime 可能更细；允许 1ms 内的误差。
+        const mtimeMatches =
+            task.mtimeMs !== undefined && Math.abs(stored.mtimeMs - task.mtimeMs) < 1;
+        if (!mtimeMatches || stored.size !== (task.bytes ?? -1)) {
+            continue;
+        }
+        candidates.add(task.relPath);
+    }
+
+    const loaded = loadReusedProjectFiles(dbPath, manifest.projectId, candidates);
+    const reused = new Map<string, ParsedFile>();
+    const tasksToParse: ParseTask[] = [];
+    const taskIndexes: number[] = [];
+    for (let index = 0; index < prepared.tasks.length; index++) {
+        const task = prepared.tasks[index];
+        const parsed = loaded.get(task.relPath);
+        if (parsed) {
+            // 模块归属已在上面比对过，这里以当前任务的值为准。
+            parsed.moduleId = task.moduleId;
+            reused.set(task.relPath, parsed);
+            continue;
+        }
+        tasksToParse.push(task);
+        taskIndexes.push(index);
+    }
+
+    return { reused, tasksToParse, taskIndexes, removed };
 };
 
 const createAccumulator = (prepared: PreparedAnalysis): ParseAccumulator => {
     const fileSlots = new Array<ParsedFile | undefined>(prepared.tasks.length);
     const warningSlots = new Array<string | undefined>(prepared.tasks.length);
     return { fileSlots, warningSlots, calls: 0, pendingWrites: 0 };
+};
+
+/** 用已解析文件构建符号索引、文件依赖与警告快照。 */
+const buildAnalysisBase = (
+    prepared: PreparedAnalysis,
+    parsedFiles: ParsedFile[],
+    store: BodyStore | undefined,
+    includeSource: boolean,
+    calls: number | undefined,
+    warnings: string[],
+): AnalysisBase => {
+    const index = createProjectIndex(parsedFiles, prepared.modules, store);
+    const fileResult = analyzeFiles(index, includeSource);
+    return {
+        prepared,
+        parsedFiles,
+        index,
+        files: fileResult.files,
+        // 初始构建沿用解析阶段统计；目录重建时直接取依赖遍历的全量计数。
+        calls: calls ?? fileResult.totalCalls,
+        resolvedCalls: fileResult.resolvedCalls,
+        warnings,
+    };
+};
+
+const createAnalysisBase = (
+    prepared: PreparedAnalysis,
+    accumulator: ParseAccumulator,
+    store: BodyStore | undefined,
+    includeSource: boolean,
+    calls: number,
+): AnalysisBase => {
+    // `collectParsedFiles` 会把解析警告并入 prepared.warnings，快照必须在它之后取。
+    const parsedFiles = collectParsedFiles(prepared, accumulator);
+    return buildAnalysisBase(prepared, parsedFiles, store, includeSource, calls, [
+        ...prepared.warnings,
+    ]);
 };
 
 /**
@@ -194,14 +397,27 @@ const acceptOutcome = (
     }
 };
 
-const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): PreparedAnalysis => {
-    const started = Date.now();
-    const root = resolve(input.root);
-    if (!existsSync(root) || !statSync(root).isDirectory()) {
-        throw new Error(`Not a directory: ${root}`);
+/**
+ * 文件可能在扫描后、解析前被删除或改名；大小只用于内存调度，
+ * 读不到时退回 undefined，让 worker 使用默认估算值。
+ */
+const fileStat = (
+    absPath: string,
+): { readonly size: number; readonly mtimeMs: number } | undefined => {
+    try {
+        const stat = statSync(absPath);
+        return { size: stat.size, mtimeMs: stat.mtimeMs };
+    } catch {
+        return undefined;
     }
+};
 
-    const options: AnalyzeOptions = {
+/** 统一归一化调用方输入；会话缓存与完整分析必须使用同一套默认值。 */
+const resolveAnalyzeOptions = (
+    input: Partial<AnalyzeOptions> & { root: string },
+    root: string,
+): AnalyzeOptions => {
+    return {
         ...DEFAULT_OPTIONS,
         ...input,
         root,
@@ -212,18 +428,18 @@ const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): Pre
         rebuildDir: input.rebuildDir ? resolveRebuildDir(input.rebuildDir, root) : undefined,
         ignore: [...(input.ignore ?? [])],
     };
+};
 
+const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): PreparedAnalysis => {
+    const started = Date.now();
+    const root = resolve(input.root);
+    if (!existsSync(root) || !statSync(root).isDirectory()) {
+        throw new Error(`Not a directory: ${root}`);
+    }
+
+    const options = resolveAnalyzeOptions(input, root);
     const warnings: string[] = [];
     const rebuildDirAbs = options.rebuildDir ? resolve(root, options.rebuildDir) : undefined;
-    const classFilterRegexes: RegExp[] = [];
-    for (const source of options.classFilters) {
-        try {
-            classFilterRegexes.push(new RegExp(source));
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            warnings.push(`Ignoring invalid --class-filter ${JSON.stringify(source)}: ${message}`);
-        }
-    }
 
     const scanned = scanProject(root, options);
     if (scanned.truncated) {
@@ -316,11 +532,14 @@ const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): Pre
     for (const file of scanned.files) {
         if (!isSourceKind(file.kind)) continue;
         const module = assignModule(file.relPath);
+        const stat = fileStat(file.absPath);
         tasks.push({
             absPath: file.absPath,
             relPath: file.relPath,
             kind: file.kind,
             moduleId: module?.id,
+            bytes: stat?.size,
+            mtimeMs: stat?.mtimeMs,
         });
         taskModules.push(module);
     }
@@ -335,11 +554,15 @@ const prepareAnalysis = (input: Partial<AnalyzeOptions> & { root: string }): Pre
         settingsFiles,
         gradleBuildFiles,
         modules,
-        classFilterRegexes,
         tasks,
         taskModules,
         cacheOptions: options.useCache
-            ? { cacheDir: options.cacheDir, root, rebuildDir: rebuildDirAbs }
+            ? {
+                  cacheDir: options.cacheDir,
+                  root,
+                  // 强制重扫描时把整个根目录视为待重建目录，从而绕过所有缓存条目。
+                  rebuildDir: input.forceReparse ? root : rebuildDirAbs,
+              }
             : undefined,
     };
 };
@@ -365,30 +588,44 @@ const collectParsedFiles = (
     return parsedFiles;
 };
 
+/**
+ * 在可复用基座上应用本次选择并展开调用树。
+ *
+ * 基座本身不保存任何调用树，所以同一个项目可以在关键词变化时反复进入这里，
+ * 而不需要重新扫描、解析或重建索引。
+ */
 const finalizeAnalysis = (
-    prepared: PreparedAnalysis,
-    accumulator: ParseAccumulator,
-    store: BodyStore | undefined,
+    base: AnalysisBase,
+    options: AnalyzeOptions,
+    started: number,
     treeSpoolPath: string | undefined,
 ): DeepReadonly<AnalysisResult> => {
+    const { prepared } = base;
     const {
-        started,
         root,
-        options,
-        warnings,
+        warnings: baseWarnings,
         scanned,
         pomFiles,
         settingsFiles,
         gradleBuildFiles,
         modules,
-        classFilterRegexes,
     } = prepared;
+    // 每次调用都复制警告，避免某次增量构建的错误提示污染后续结果。
+    const warnings = [...baseWarnings];
 
-    // 方法体已经剥离到工作库，索引里只保留类型/方法签名这类轻量符号。
-    const parsedFiles = collectParsedFiles(prepared, accumulator);
-    const index = createProjectIndex(parsedFiles, modules, store);
-    const endpointResult = buildEndpoints(index);
-    linkFeignEndpoints(index, endpointResult.endpoints, endpointResult.feignOperations);
+    // 类名过滤只影响本次调用树，不能缓存：用户可能在两次分析之间修改过滤正则。
+    const classFilterRegexes: RegExp[] = [];
+    for (const source of options.classFilters) {
+        try {
+            classFilterRegexes.push(new RegExp(source));
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            warnings.push(`Ignoring invalid --class-filter ${JSON.stringify(source)}: ${message}`);
+        }
+    }
+
+    const endpointResult = buildEndpoints(base.index);
+    linkFeignEndpoints(base.index, endpointResult.endpoints, endpointResult.feignOperations);
 
     const selectedEndpoints = options.buildTrees
         ? selectEndpoints(endpointResult.endpoints, {
@@ -418,7 +655,7 @@ const finalizeAnalysis = (
     try {
         if (options.buildTrees) {
             buildCallTrees(
-                index,
+                base.index,
                 selectedEndpoints,
                 endpointResult.feignOperations,
                 treeOptions,
@@ -428,14 +665,14 @@ const finalizeAnalysis = (
 
             if (options.classNames.length > 0 || options.methodNames.length > 0) {
                 const traceResult = buildMethodTraces(
-                    index,
+                    base.index,
                     { classNames: options.classNames, methodNames: options.methodNames },
                     endpointResult.endpoints,
                 );
                 traces = filterTracesByKeywords(traceResult.traces, options.keywords);
                 warnings.push(...traceResult.warnings);
                 buildTraceTrees(
-                    index,
+                    base.index,
                     traces,
                     endpointResult.endpoints,
                     endpointResult.feignOperations,
@@ -478,30 +715,31 @@ const finalizeAnalysis = (
         treeSpool?.close();
     }
 
-    // 依赖边与 resolved 计数在同一次遍历里完成，避免重复解析所有方法。
-    const fileResult = analyzeFiles(index, options.includeSource);
-    const files = fileResult.files;
+    const files = options.includeSource ? base.files : [];
     const moduleEdges = buildModuleEdges(modules);
 
     const stats: AnalysisStats = {
         filesScanned: scanned.files.length,
-        sourceFiles: parsedFiles.length,
-        javaFiles: parsedFiles.filter((file) => file.language === "java").length,
-        kotlinFiles: parsedFiles.filter((file) => file.language === "kotlin").length,
-        groovyFiles: parsedFiles.filter((file) => file.language === "groovy").length,
+        sourceFiles: base.parsedFiles.length,
+        javaFiles: base.parsedFiles.filter((file) => file.language === "java").length,
+        kotlinFiles: base.parsedFiles.filter((file) => file.language === "kotlin").length,
+        groovyFiles: base.parsedFiles.filter((file) => file.language === "groovy").length,
         buildFiles: pomFiles.length + gradleBuildFiles.length + settingsFiles.length,
         modules: modules.length,
-        types: index.typesByFqn.size,
-        methods: [...index.typesByFqn.values()].reduce((sum, type) => sum + type.methods.length, 0),
-        calls: accumulator.calls,
-        resolvedCalls: fileResult.resolvedCalls,
+        types: base.index.typesByFqn.size,
+        methods: [...base.index.typesByFqn.values()].reduce(
+            (sum, type) => sum + type.methods.length,
+            0,
+        ),
+        calls: base.calls,
+        resolvedCalls: base.resolvedCalls,
         endpoints: endpointResult.endpoints.length,
         endpointsBuilt: endpointResult.endpoints.filter((endpoint) => endpoint.treeBuilt).length,
         traces: traces.length,
         tracesBuilt: traces.filter((trace) => trace.treeBuilt).length,
         feignClients: endpointResult.feignClients.length,
         feignOperations: endpointResult.feignOperations.length,
-        parseErrors: parsedFiles.reduce((sum, file) => sum + file.parseErrors, 0),
+        parseErrors: base.parsedFiles.reduce((sum, file) => sum + file.parseErrors, 0),
         durationMs: Date.now() - started,
     };
 

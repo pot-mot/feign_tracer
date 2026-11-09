@@ -51,7 +51,7 @@ npx tsx src/cli.ts D:/path/to/project --stdout > result.json
 # 只索引端点，不构建调用树
 npx tsx src/cli.ts D:/path/to/project --no-trees
 
-# 关键词 + 精确类名 + 精确函数名（三者 AND），只构建匹配的调用链
+# 关键词 + 类名 + 函数名（三者 AND，均支持模糊匹配），只构建匹配的调用链
 npx tsx src/cli.ts D:/path/to/project --keyword order --class-name OrderController --method-name list --print-trees
 
 # 直接追踪接口方法：每个实现类各生成一棵调用树
@@ -61,7 +61,7 @@ npx tsx src/cli.ts D:/path/to/project --class-name OrderService --method-name li
 npx tsx src/cli.ts D:/path/to/project --rebuild-dir src/main/java/com/acme/order
 ```
 
-搜索条件在服务端和客户端都按 **AND** 组合：关键词必须在端点/方法信息中命中，类名必须精确匹配简单名或全限定名，函数名必须精确匹配。增量选择默认合并进已有 `--db`；需要整库重建时加 `--fresh`。
+搜索条件在服务端和客户端都按 **AND** 组合：关键词、类名、函数名都支持不区分大小写的子串匹配和 `/regex/flags` 正则；类名同时匹配简单名与全限定名。增量选择默认合并进已有 `--db`；需要重写分析结果时加 `--fresh`。
 
 启动 Web UI：
 
@@ -71,10 +71,15 @@ npm run dev
 
 打开终端提示的地址（默认 `http://localhost:5173`），输入项目根目录后点击“开始分析”。界面提供：
 
-- “端点关键词 / 精确类名 / 精确函数名”三个搜索输入框，只展示符合条件（AND）的调用链；
+- “端点关键词 / 类名 / 函数名”使用自绘 `ft-select` 可搜索输入框，输入框本身即搜索框，支持手输和候选选择；三个条件按 AND 过滤；选中项目根目录后会自动加载各自候选；
 - “方法调用链”页签：输入接口类名与函数名时，列出每个实现类的独立调用树；
 - “参数列表 / 参数类型 / 可见性”显示开关；
-- 未构建的端点/方法链卡片上的“构建调用树”按钮，用于按需增量构建。
+- 未构建的端点/方法链卡片上的“构建调用树”按钮，用于按需增量构建；
+- 多次修改关键词继续分析时直接按 `projects.base_dir` 复用数据库中的项目索引，不重新扫描或解析源码；
+- “强制重扫描”按钮忽略索引与解析缓存；在“重扫描目录”中填写相对路径时只重新解析该目录，留空则重建整个项目。
+- 页面使用 hash 路由：`#/analyze` 为分析页，`#/database` 为数据库浏览页。
+- “项目根目录”使用自绘 `ft-select` WebComponent：输入框即搜索框，可从当前数据库 `projects.base_dir` 中筛选已保存项目，也可以直接手输路径。
+- 数据库页可填写任意 SQLite 路径，按表生成 tab；每个表支持分页查看、新增行、编辑行和删除行，视图为只读。
 
 构建：
 
@@ -125,8 +130,8 @@ npx tsx src/cli.ts D:/path/to/project --class-filter "com\\.acme\\..*(Service|Ma
 | 条件 | CLI | Web UI | 匹配规则 |
 | --- | --- | --- | --- |
 | 端点关键词 | `--keyword order` | 端点关键词 | 对端点 id、路径、handler、Controller、模块做不区分大小写的包含匹配；多个关键词全部命中 |
-| 精确类名 | `--class-name OrderService` | 精确类名 | 精确匹配简单名或全限定名；不支持模糊后缀 |
-| 精确函数名 | `--method-name list` | 精确函数名 | 精确匹配方法名，重载会全部命中 |
+| 类名 | `--class-name OrderService` | 类名 | 对简单名或全限定名做包含匹配，也可用 `/regex/`；多个词之间为 OR |
+| 函数名 | `--method-name list` | 函数名 | 对方法名做包含匹配，也可用 `/regex/`；重载会全部命中，多个词之间为 OR |
 
 三个条件之间是 **AND**。例如：
 
@@ -157,7 +162,9 @@ npx tsx src/cli.ts . --class-name OrderService --method-name list
 - 已删除的端点会被清理；
 - trace 元数据与调用树也会保留，便于多次按需构建。
 
-使用 `--fresh` 可忽略已有数据库，整库重建。解析缓存默认位于 `.feign-tracer-cache/`，按文件 `mtime + size + module` 校验；`--rebuild-dir` 指定目录下的文件会强制重新解析。可用 `--no-cache` 关闭缓存，或 `--cache-dir` 指定位置。
+使用 `--fresh` 可重写分析结果，但项目索引仍会保留。扫描结果按项目持久化到 SQLite：`projects.base_dir` 是项目匹配键，`project_files` 多对一关联项目，`project_classes` 关联文件，`project_methods` 关联类，`project_calls` 同时关联调用方与被调用方函数。再次扫描同一 `baseDir` 时，只重新解析 `mtime + size + module` 发生变化的文件。`--rebuild-dir` 会强制重新解析该目录；强制重扫描会忽略项目索引重新读取全部源码。解析缓存仍默认位于 `.feign-tracer-cache/`，可用 `--no-cache` 关闭，或用 `--cache-dir` 指定位置。
+
+历史数据库会在首次被分析、项目列表或数据库页读取时自动迁移：升级到当前 schema，用 `analysis.root` 回填缺失的 `projects.base_dir`，统一历史路径分隔符，并删除不在当前 schema 中的表和视图。无需额外命令或按钮。
 
 ## CLI 选项
 
@@ -176,15 +183,17 @@ feign-tracer <root-directory> [options]
     --class-filter <re>   逗号分隔的类名正则，覆盖默认过滤
     --all-classes         关闭类名过滤
     --keyword <text>      端点关键词，可重复或逗号分隔
-    --class-name <name>   精确类名（简单名或全限定名），可重复/逗号分隔
-    --method-name <name>  精确函数名，可重复/逗号分隔
+    --class-name <name>   模糊类名（简单名/全限定名，子串或正则），可重复/逗号分隔
+    --method-name <name>  模糊函数名（子串或正则），可重复/逗号分隔
     --no-trees            只索引端点/方法链，不展开调用树
     --rebuild-dir <dir>   只重建该目录下的端点，并跳过该目录的解析缓存
     --no-cache            关闭解析缓存
     --cache-dir <dir>     解析缓存目录                      [.feign-tracer-cache]
     --no-work-db          方法体不落临时工作库，全部留在内存（仅适合小项目）
     --jobs <n>            解析线程数：0 = 自动，1 = 单线程            [0]
-    --fresh               重建数据库，不合并增量结果
+                          （解析并发按内存预算限制大文件数量，
+                          可用 FEIGN_TRACER_PARSE_MEMORY_MB 覆盖预算）
+    --fresh               重写分析结果，保留项目索引
     --list-endpoints      打印端点/方法链及构建状态
     --hide-params         控制台调用树隐藏参数列表
     --show-param-types    显示参数类型（name: Type）
@@ -217,7 +226,10 @@ npx tsx src/cli.ts examples/shop --format both --db out/shop.db --out out/shop.j
    工作库在分析结束时自动删除，不进入输出。`--no-work-db` 可关闭该行为。
 2. **解析并发**：worker 采用"完成一个就领下一个"的逐文件派发，不再按文件数静态分批，
    每个 worker 的堆上最多只有正在解析的那一个文件；worker 异常时只补跑未交付的文件，
-   不会重复计入模块文件数或工作库。
+   不会重复计入模块文件数或工作库。调度器还会按源码字节估算单文件解析峰值，
+   在默认 6144MB 预算内限制同时在途的大文件；超过预算的超大文件独占一个 worker。
+   缓存命中时仍按源码大小保守估算，宁可少并发也不冒内存峰值风险。
+   可用 `FEIGN_TRACER_PARSE_MEMORY_MB` 调整预算（单位 MB，影响解析并发调度）。
 3. **调用树**：`--format sqlite` 下逐端点展开后立即写入临时 NDJSON 暂存文件并从内存释放，
    写库时再流式读回插入 `call_nodes`，常驻内存只与"当前正在展开的根"有关。
 
@@ -228,16 +240,21 @@ npx tsx src/cli.ts examples/shop --format both --db out/shop.db --out out/shop.j
 
 默认输出为单个本地 SQLite 文件（`feign-trace.db`），使用事务 + 预编译语句批量写入，并先写临时文件再原子替换，避免中断留下半成品。Web UI 可在“SQLite 保存路径”中填写文件路径（留空则只分析不落盘）。
 
-数据库结构（`PRAGMA user_version = 3`）：
+数据库结构（`PRAGMA user_version = 4`）：
 
 | 表 / 视图 | 内容 |
 | --- | --- |
+| `projects` | 持久化项目索引的根：`base_dir` 唯一，用于跨次扫描匹配同一项目 |
+| `project_files` | 源文件清单，多对一关联 `projects`；保存 `mtime_ms`、`size` 与 `parsed_json` |
+| `project_classes` | 类/接口/枚举，多对一关联 `project_files`，支持嵌套类父子关系 |
+| `project_methods` | 函数/方法，多对一关联 `project_classes` |
+| `project_calls` | 调用边，关联调用方函数与被调用方函数，并保留参数/行号等调用点信息 |
 | `analysis` | 根目录、生成时间、工具版本、分析选项 JSON、耗时 |
 | `stats` | 各项统计计数（含 `endpointsBuilt` / `traces` / `tracesBuilt`） |
 | `modules` / `module_dependencies` | 模块、构建依赖（内部模块与外部坐标） |
 | `module_edges` / `module_children` | 模块依赖边、聚合子模块 |
 | `endpoints` | Controller 端点（HTTP 方法、路径、handler、模块、文件、行号、`tree_built`） |
-| `traces` | 精确类名/函数名的方法级根节点（含 `implementation_of`、`tree_built`） |
+| `traces` | 按类名/函数名筛选出的方法级根节点（含 `implementation_of`、`tree_built`） |
 | `call_nodes` | 端点与方法链共用的调用树扁平表；`root_type` 区分 `endpoint/trace`，`endpoint_id + seq` 为主键 |
 | `feign_clients` / `feign_client_methods` | Feign 客户端及其方法 |
 | `feign_operations` / `feign_operation_targets` | Feign 远程调用及匹配到的远程端点 |
@@ -437,7 +454,7 @@ WHERE to_type = 'com.example.order.client.UserClient';
 - **构建文件**：Maven 使用 XML ANTLR parser；Gradle 通过针对 `build.gradle(.kts)` / `settings.gradle(.kts)` 的定向扫描提取 `include` 与依赖声明。
 - 调用解析基于静态源码：字段/局部变量类型、参数类型、`this`、接口到实现、类名限定调用。反射、动态代理、Lambda 内部调用等无法完全还原。
 - 接口/抽象类方法存在多个实现时，会为每个实现类展开独立分支；如果一个实现都没有，则停留在接口方法的抽象节点。
-- 同名类的精确类名建议优先使用全限定名；简单名会匹配所有同名类。
+- 同名类建议优先使用全限定名或更长的子串；模糊类名会匹配所有包含该文本的类。
 
 ## 目录结构
 
@@ -451,9 +468,14 @@ src/
   build/                    Maven / Gradle / XML 解析
   languages/               Java / Kotlin / Groovy 结构提取与调用扫描
   graph/                   索引、解析、端点、调用树、方法链、文件依赖
-  store/sqlite.ts          SQLite 持久化、增量合并与表结构
+  store/schema.ts          分析表与项目索引表的共享 schema 定义
+  store/sqlite.ts          SQLite 持久化、增量合并与表结构迁移
+  store/project.ts         项目索引持久化（projects → files → classes → methods → calls）
+  store/db-admin.ts        数据库浏览/CRUD 的表结构反射与安全读写
   store/bodies.ts          方法体临时工作库（落盘 + LRU 懒加载）
   store/tree-spool.ts      调用树暂存文件（流式写库）
+  web/main.ts              分析页、hash 路由入口
+  web/database.ts          数据库浏览页、按表的增删改查
   cli.ts                   命令行入口
   generated/               生成的 ANTLR TypeScript parser
 tests/                     识别结果回归（提取 / 解析 / 调用树 / 快照 / 落库）

@@ -364,3 +364,20 @@ test("接口方法按精确类名追踪时每个实现各成一棵树", async ()
         true,
     );
 });
+
+test("类名与函数名支持模糊匹配并去重", async () => {
+    const endpoints = await analyze({ classNames: ["TreeContro"], methodNames: ["ru"] });
+    assert.deepEqual(
+        endpoints.endpoints.filter((endpoint) => endpoint.treeBuilt).map((endpoint) => endpoint.id),
+        ["GET /tree/run"],
+    );
+
+    const traces = await analyze({ classNames: ["Pay"], methodNames: ["charg"] });
+    assert.deepEqual(
+        traces.traces.map((trace) => [trace.className, trace.implementationOf]),
+        [
+            ["com.acme.tree.service.PayA", "com.acme.tree.service.ApiPay"],
+            ["com.acme.tree.service.PayB", "com.acme.tree.service.ApiPay"],
+        ],
+    );
+});

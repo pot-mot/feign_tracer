@@ -160,7 +160,7 @@ npm run build
 - 类型检查零错误；
 - `examples/shop` 能生成端点树、Feign 远程调用链与 SQLite 数据库；
 - `examples/cycles` 能展开两个接口实现，并在递归节点标记 `cyclic: true`；
-- Web UI 的搜索条件按“端点关键词 + 精确类名 + 精确函数名”AND 过滤；
+- Web UI 的搜索条件按“端点关键词 + 类名 + 函数名”AND 过滤，三者均支持模糊匹配；
 - 增量构建后未选中的端点树和方法链仍然保留。
 
 ## 例外与边界

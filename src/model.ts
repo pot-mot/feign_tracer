@@ -278,7 +278,7 @@ export interface AnalysisStats {
     endpoints: number;
     /** 本次运行展开调用树的端点数量。 */
     endpointsBuilt: number;
-    /** 精确类名/函数名的方法级入口数量。 */
+    /** 按类名/函数名筛选出的方法级入口数量。 */
     traces: number;
     tracesBuilt: number;
     feignClients: number;
@@ -306,7 +306,7 @@ export interface AnalysisResult {
     modules: ModuleInfo[];
     moduleEdges: ModuleEdge[];
     endpoints: EndpointInfo[];
-    /** 用户指定的精确类名/函数名入口。 */
+    /** 用户按类名/函数名筛选出的方法级入口。 */
     traces: MethodTrace[];
     feignClients: Array<{
         id: string;
@@ -341,9 +341,9 @@ export interface AnalyzeOptions {
     classFilters: string[];
     /** 仅为此类关键词匹配的端点构建调用树（空表示全部）。 */
     keywords: string[];
-    /** 用于方法级调用链和端点过滤的精确类名（简单名或 FQN）。 */
+    /** 用于方法级调用链和端点过滤的类名（简单名/FQN，支持子串与正则）。 */
     classNames: string[];
-    /** 用于方法级调用链和端点过滤的精确函数名。 */
+    /** 用于方法级调用链和端点过滤的函数名（支持子串与正则）。 */
     methodNames: string[];
     /** 为 false 时只索引端点，不展开调用树。 */
     buildTrees: boolean;
@@ -351,6 +351,8 @@ export interface AnalyzeOptions {
     rebuildDir?: string;
     /** 在多次运行间复用已解析源文件。 */
     useCache: boolean;
+    /** 忽略解析缓存，强制重新读取并解析全部源码（仅本次运行有效）。 */
+    forceReparse?: boolean;
     /** 解析缓存目录（相对当前工作目录解析）。 */
     cacheDir: string;
     /** 解析使用的 worker 线程数：0 自动，1 表示单线程。 */

@@ -5,7 +5,11 @@ import { join } from "node:path";
 import sqlite3 from "node-sqlite3-wasm";
 import { analyzeDirectoryAsync } from "../src/analyze.ts";
 import type { CallTreeNode } from "../src/model.ts";
-import { SQLITE_SCHEMA_VERSION, writeAnalysisToSqlite } from "../src/store/sqlite.ts";
+import {
+    ensureDatabaseReady,
+    SQLITE_SCHEMA_VERSION,
+    writeAnalysisToSqlite,
+} from "../src/store/sqlite.ts";
 import type { DeepReadonly } from "../src/types.ts";
 import { makeTempDir, removeDir } from "./test-utils.ts";
 
@@ -234,4 +238,45 @@ test("暂存文件与内存树写出的库内容一致", async () => {
             ),
         );
     assert.deepEqual(dump(streamedDb), dump(memoryDb));
+});
+
+test("旧库在读取入口自动迁移：升级 schema、回填 projects、删除未知表/视图", async () => {
+    const dbPath = join(workDir, "auto-migrate.db");
+    const result = await analyzeDirectoryAsync({
+        root: shopRoot,
+        useCache: false,
+        parseWorkers: 1,
+        buildTrees: false,
+    });
+    writeAnalysisToSqlite(result, dbPath);
+
+    const mutate = new Database(dbPath);
+    try {
+        mutate.exec("DELETE FROM projects");
+        mutate.exec("CREATE TABLE legacy_table (id INTEGER PRIMARY KEY, value TEXT)");
+        mutate.exec("CREATE VIEW legacy_view AS SELECT id FROM legacy_table");
+        mutate.exec("INSERT INTO legacy_table (value) VALUES ('old')");
+        mutate.exec("PRAGMA user_version = 3");
+    } finally {
+        mutate.close();
+    }
+
+    ensureDatabaseReady(dbPath);
+
+    read(dbPath, (db) => {
+        const legacyTables = db
+            .all("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'legacy%'")
+            .map((row) => text(row.name));
+        const legacyViews = db
+            .all("SELECT name FROM sqlite_master WHERE type = 'view' AND name LIKE 'legacy%'")
+            .map((row) => text(row.name));
+        assert.deepEqual(legacyTables, []);
+        assert.deepEqual(legacyViews, []);
+        assert.equal(asNumber(db.get("PRAGMA user_version")?.user_version), SQLITE_SCHEMA_VERSION);
+        const roots = db.all("SELECT base_dir FROM projects").map((row) => text(row.base_dir));
+        assert.equal(
+            roots.some((root) => root.endsWith("/examples/shop")),
+            true,
+        );
+    });
 });
